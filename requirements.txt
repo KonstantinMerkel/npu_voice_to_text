@@ -1,0 +1,6 @@
+# openvino-genai must match the Intel NPU libraries fetched by install.sh
+# (linux-npu-driver v1.38 <-> OpenVINO 2026.4). Upgrade both together.
+openvino-genai~=2026.4.0
+numpy>=2
+sounddevice>=0.5
+huggingface_hub>=1.0

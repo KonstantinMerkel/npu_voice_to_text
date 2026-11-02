@@ -1,0 +1,20 @@
+[Unit]
+Description=npu-voice-to-text: hold-to-talk dictation with Whisper on the Intel NPU
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+# Options are read from ~/.config/npu-voice-to-text/options (one per line, written by
+# install.sh), see `npu-voice-to-text serve --help`. After editing it:
+#   systemctl --user restart npu-voice-to-text
+ExecStart=%h/.local/bin/npu-voice-to-text serve
+# Intel's NPU userspace driver + compiler, matching the pip OpenVINO version
+# (installed by install.sh; distro packages are often too old)
+Environment=LD_LIBRARY_PATH=%h/.local/share/npu-voice-to-text/lib
+Restart=on-failure
+RestartSec=5
+# the very first start compiles the model for the NPU
+TimeoutStartSec=600
+
+[Install]
+WantedBy=graphical-session.target

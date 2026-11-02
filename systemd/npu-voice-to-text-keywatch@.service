@@ -1,0 +1,27 @@
+[Unit]
+Description=npu-voice-to-text key watcher for UID %i (forwards press/release of one key)
+
+[Service]
+# Instance name = UID of the user running npu-voice-to-text:
+#   systemctl enable --now npu-voice-to-text-keywatch@1000
+# The key is set in /etc/npu-voice-to-text/keywatch-<uid>.env (KEY=F8), written by install.sh.
+Environment=KEY=F8
+EnvironmentFile=-/etc/npu-voice-to-text/keywatch-%i.env
+ExecStart=/usr/bin/python3 -I /usr/local/bin/npu-voice-to-text-keywatch --key ${KEY} --socket /run/user/%i/npu-voice-to-text.sock
+Restart=always
+RestartSec=2
+
+# Root is needed to read /dev/input. Everything else is taken away:
+# CAP_DAC_OVERRIDE is the only capability kept (to connect to the user's 0600 socket).
+CapabilityBoundingSet=CAP_DAC_OVERRIDE
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+
+[Install]
+WantedBy=multi-user.target
