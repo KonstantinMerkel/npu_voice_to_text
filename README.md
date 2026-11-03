@@ -20,13 +20,13 @@ Hold a key (F8 by default), speak German or English, release. About two seconds 
 | NPU firmware | From your distro (`intel-npu-firmware` on Fedora, `linux-firmware` elsewhere). |
 | GNOME on Wayland | The layout is read from GNOME settings. Other desktops: pass `--layout`. |
 | Python 3.10+ | |
-| System libraries | Level Zero loader, oneTBB, PortAudio, libxkbcommon, `wl-clipboard`, `ydotool`, `libnotify`, `binutils` (for `ar`) |
+| System libraries | Level Zero loader, oneTBB, PortAudio, libxkbcommon, `wl-clipboard`, `ydotool`, `binutils` (for `ar`) |
 
 ```bash
 # Fedora
-sudo dnf install oneapi-level-zero tbb portaudio libxkbcommon wl-clipboard ydotool libnotify binutils
+sudo dnf install oneapi-level-zero tbb portaudio libxkbcommon wl-clipboard ydotool binutils
 # Ubuntu / Debian
-sudo apt install libze1 libtbb12 libportaudio2 libxkbcommon0 wl-clipboard ydotool libnotify-bin binutils
+sudo apt install libze1 libtbb12 libportaudio2 libxkbcommon0 wl-clipboard ydotool binutils
 ```
 
 You don't need distro OpenVINO or NPU-compiler packages. `install.sh` fetches the exact versions that work together. Fedora's `intel-npu-compiler`, for example, is too old for current OpenVINO, and it pulls in about 8 GB of dependencies.

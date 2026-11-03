@@ -84,14 +84,12 @@ def request(cmd: str, timeout: float = 5) -> str | None:
 
 
 def run_client(cmd: str, quiet: bool = False) -> int:
-    """quiet: no output and no notification, only the exit code (for scripts)."""
+    """quiet: no output, only the exit code (for scripts)."""
     reply = request(cmd)
     if reply is None:
         if not quiet:
-            msg = "npu-voice-to-text is not running (systemctl --user start npu-voice-to-text)"
-            print(msg, file=sys.stderr)
-            subprocess.run(["notify-send", "-a", "npu-voice-to-text", "-e", "npu-voice-to-text",
-                            msg], check=False)
+            print("npu-voice-to-text is not running (systemctl --user start npu-voice-to-text)",
+                  file=sys.stderr)
         return 1
     if not quiet:
         print(reply)
@@ -492,27 +490,6 @@ class Recorder:
 # =========================================================================== #
 # Daemon: state machine + socket server
 # =========================================================================== #
-class Notifier:
-    """notify-send wrapper that keeps updating one notification instead of stacking."""
-
-    def __init__(self, enabled: bool):
-        self.enabled, self.nid = enabled, None
-
-    def __call__(self, body: str, urgency: str = "low", timeout_ms: int = 3000):
-        if not self.enabled:
-            return
-        cmd = ["notify-send", "-a", "npu-voice-to-text", "-e", "-p", "-u", urgency,
-               "-t", str(timeout_ms), "-i", "audio-input-microphone"]
-        if self.nid:
-            cmd += ["-r", self.nid]
-        try:
-            out = subprocess.run(cmd + ["npu-voice-to-text", body], capture_output=True, text=True,
-                                 timeout=3).stdout.strip()
-            self.nid = out or self.nid
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-
-
 class Daemon:
     """idle --press--> recording --release--> transcribing --(typed)--> idle
 
@@ -522,7 +499,6 @@ class Daemon:
 
     def __init__(self, args):
         self.args = args
-        self.notify = Notifier(not args.quiet)
         self.lock = threading.Lock()
         self.state = "loading"
         t0 = time.monotonic()
@@ -546,7 +522,6 @@ class Daemon:
             self.recorder.start()
             self.state = "recording"
         self._sound(SOUND_START)
-        self.notify("🎙 Listening…", timeout_ms=MAX_SECONDS * 1000)
         return "recording"
 
     def release(self) -> str:
@@ -568,7 +543,6 @@ class Daemon:
                 return f"nothing to cancel ({self.state})"
             self.recorder.stop()
             self.state = "idle"
-        self.notify("Cancelled", timeout_ms=1000)
         return "cancelled"
 
     def handle(self, cmd: str) -> str:
@@ -591,19 +565,13 @@ class Daemon:
                       flush=True)
             if speech < MIN_SPEECH_SECONDS:
                 print(f"[{levels}] nothing heard", flush=True)
-                self.notify("Nothing heard", timeout_ms=1500)
                 return
-            self.notify(f"⏳ Transcribing {secs:.1f}s…", timeout_ms=30000)
             text, lang, dt = self.transcriber(audio, speech)
             print(f"[{levels}, {dt:.2f}s, {lang}] {text}", flush=True)
-            if not text:
-                self.notify("Nothing recognised", timeout_ms=1500)
-                return
-            self.keyboard.write(text + (" " if self.args.trailing_space else ""))
-            self.notify(f"✓ {dt:.1f}s: {text[:120]}", timeout_ms=2500)
+            if text:
+                self.keyboard.write(text + (" " if self.args.trailing_space else ""))
         except Exception as e:                      # keep the daemon alive
             print(f"dictation failed: {e!r}", file=sys.stderr, flush=True)
-            self.notify(f"Error: {e}", urgency="critical", timeout_ms=5000)
         finally:
             self.state = "idle"
 
@@ -708,7 +676,6 @@ def main() -> int:
                    help="microphone: a PipeWire source name from `pactl list sources short` "
                         "(or a sounddevice id/name). Default: the system default")
     g.add_argument("--sounds", action="store_true", help="play start/stop sounds")
-    g.add_argument("--quiet", action="store_true", help="no desktop notifications")
 
     dl = sub.add_parser("download", help="download a Whisper model")
     dl.add_argument("--model", default=DEFAULT_MODEL)

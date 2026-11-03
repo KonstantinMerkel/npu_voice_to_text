@@ -41,7 +41,7 @@ step "Checking requirements"
 [[ -e /dev/accel/accel0 ]] || die "no NPU found (/dev/accel/accel0). Needs an Intel Core Ultra CPU and the intel_vpu kernel driver."
 [[ -r /dev/accel/accel0 && -w /dev/accel/accel0 ]] || die "/dev/accel/accel0 is not read/writable for you (normally group 'render')."
 missing=()
-for cmd in python3 curl ar tar ydotool wl-copy wl-paste notify-send gsettings; do
+for cmd in python3 curl ar tar ydotool wl-copy wl-paste gsettings; do
     command -v "$cmd" >/dev/null || missing+=("$cmd")
 done
 has_lib libze_loader.so.1    || missing+=("Level Zero loader (Fedora: oneapi-level-zero, Ubuntu: libze1)")
