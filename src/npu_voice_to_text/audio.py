@@ -140,7 +140,7 @@ class Recorder:
         """Open and start a stream on a PipeWire source (None: the system default)."""
         if node:
             # read by PipeWire's ALSA plugin when the stream opens. Removed right after,
-            # so programs we start later (pw-play, ydotool) don't inherit it
+            # so programs we start later (pw-play) don't inherit it
             os.environ["PIPEWIRE_NODE"] = node
         try:
             stream = self.sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",

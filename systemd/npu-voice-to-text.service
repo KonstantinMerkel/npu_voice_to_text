@@ -13,6 +13,9 @@ ExecStart=%h/.local/bin/npu-voice-to-text serve
 Environment=LD_LIBRARY_PATH=%h/.local/share/npu-voice-to-text/lib
 Restart=on-failure
 RestartSec=5
+# 3 = keyboard access was declined in the GNOME dialog: don't ask again every 5 s
+# (re-run install.sh to be asked again)
+RestartPreventExitStatus=3
 # the very first start compiles the model for the NPU
 TimeoutStartSec=600
 

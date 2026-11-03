@@ -8,7 +8,8 @@ Modules:
   daemon       state machine (record / queue / transcribe / type) + socket server
   audio        microphone recorder and the speech detector
   transcriber  language choice (CPU) and transcription (NPU) with OpenVINO GenAI
-  keyboard     text -> keystrokes for the active xkb layout, typed through ydotool
+  keyboard     text -> keystrokes for the active xkb layout
+  portal       sends them through the RemoteDesktop portal (GNOME asks once)
   models       Whisper model ids, where they live, `download`
   paths        file locations
 
@@ -17,4 +18,4 @@ huggingface_hub only by `download`.
 See docs/ARCHITECTURE.md for how the pieces fit together.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

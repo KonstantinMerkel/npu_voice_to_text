@@ -17,12 +17,13 @@ dependencies = [
     "numpy>=2",
     "sounddevice>=0.5",
     "huggingface_hub>=1.0",
+    "jeepney>=0.8",            # D-Bus, for the RemoteDesktop portal (typing)
 ]
 
 [project.optional-dependencies]
 # The tests need neither OpenVINO nor a microphone:
-#   uvx --with numpy pytest
-test = ["pytest>=8", "numpy>=2"]
+#   uvx --with numpy --with jeepney pytest
+test = ["pytest>=8", "numpy>=2", "jeepney>=0.8"]
 
 # No [project.scripts]: install.sh writes ~/.local/bin/npu-voice-to-text, which runs
 # `python -I -m npu_voice_to_text`.

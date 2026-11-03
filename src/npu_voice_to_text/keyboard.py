@@ -2,49 +2,46 @@
 # Copyright (C) 2026 Konstantin Merkel
 """Keyboard: type text into the focused window.
 
-Wayland lets no app type into another, so the text goes through ydotool (kernel
-uinput). ydotool only sends key codes, so the codes for each character are worked
-out from the active xkb layout with libxkbcommon (XkbKeymap). Characters the layout
-can't produce (emoji; on a US layout also umlauts, € and typographic quotes) are
-pasted with Shift+Insert, and the clipboard is restored afterwards.
+Wayland lets no app type into another; the RemoteDesktop portal (portal.py) is the
+sanctioned way, with the user's one-time consent. It sends key *codes*, which the
+compositor interprets with the active layout, so the codes for each character are
+worked out from that layout with libxkbcommon (XkbKeymap). Characters the layout has
+no key for are replaced (SUBSTITUTES: ä -> ae, „ -> ", ...; else the letter without
+its accent). Whatever is left - emoji, which speech recognition doesn't produce
+anyway - is left out.
 """
 
 import ast
 import ctypes
-import os
 import subprocess
-import sys
 import time
 import unicodedata
-from pathlib import Path
-
-from . import paths
 
 # Linux input event codes (layout independent), see linux/input-event-codes.h
 KEY_LEFTSHIFT, KEY_RIGHTALT, KEY_SPACE = 42, 100, 57
 ISO_LEVEL3_SHIFT = 0xFE03  # keysym of the AltGr function
 # xkb's virtual <LVL3> and <MDSW> keys: they exist in every keymap, but no keyboard
-# has them, and ydotoold's virtual keyboard can't send them either
+# has them, so they can't be sent
 XKB_VIRTUAL_KEYS = {84, 195}
 # keys we type with: the main block (codes 1-54) plus space, 102ND (<>|), RO and YEN.
-# Characters only found elsewhere - keypad, KEY_EURO on us, media keys - are pasted
-# instead, because many apps ignore those keys.
+# Characters only found elsewhere - keypad, KEY_EURO on us, media keys - count as
+# missing, because many apps ignore those keys.
 TYPING_KEYS = frozenset(range(1, 55)) | {57, 86, 89, 124}
-# Pasting the characters a layout can't type: Shift+Insert, with the text in both the
-# clipboard and the primary selection. Apps (GTK, Qt, browsers, Electron, LibreOffice)
-# paste the clipboard on Shift+Insert, terminals (VTE, kitty, foot, Alacritty, xterm)
-# paste the primary selection - so one shortcut works everywhere, unlike Ctrl+V
-# (terminals need Ctrl+Shift+V there).
-PASTE_KEYS = "42:1 110:1 110:0 42:0"
-SELECTIONS = ((), ("--primary",))       # wl-copy / wl-paste flags: clipboard, primary
-CLIPBOARD_FILE_TYPES = ("x-special/gnome-copied-files",)
-CLIPBOARD_TEXT_TYPES = ("text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "STRING",
-                        "TEXT")
 # dead keysym -> (combining mark it adds, character it types when followed by space)
 DEAD_KEYS = {
-    0xFE50: ("̀", "`"), 0xFE51: ("́", "´"), 0xFE52: ("̂", "^"),
-    0xFE53: ("̃", "~"), 0xFE57: ("̈", "¨"), 0xFE58: ("̊", "°"),
-    0xFE5B: ("̧", "¸"),
+    0xFE50: ("\u0300", "`"), 0xFE51: ("\u0301", "´"), 0xFE52: ("\u0302", "^"),
+    0xFE53: ("\u0303", "~"), 0xFE57: ("\u0308", "¨"), 0xFE58: ("\u030a", "°"),
+    0xFE5B: ("\u0327", "¸"),
+}
+# Typed instead when the layout has no key for a character (German and English
+# text on a layout without umlauts, typographic punctuation on a US layout, ...).
+# Other characters fall back to their letter without the accent (ñ -> n).
+SUBSTITUTES = {
+    "ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue", "ß": "ss", "ẞ": "SS",
+    "„": '"', "“": '"', "”": '"', "«": '"', "»": '"',
+    "‚": "'", "‘": "'", "’": "'", "‹": "'", "›": "'",
+    "–": "-", "—": "-", "\u2011": "-", "…": "...", "€": "EUR", "•": "-", "·": ".",
+    "\u00a0": " ", "\u202f": " ",          # (narrow) no-break space
 }
 
 
@@ -113,7 +110,8 @@ class XkbKeymap:
                     if x.xkb_keymap_num_layouts_for_key(km, kc) >= 1]
 
         # The key that acts as AltGr: Right Alt on most layouts, but options like
-        # compose:ralt or lv3:caps_switch move it. None: AltGr characters get pasted.
+        # compose:ralt or lv3:caps_switch move it. None: AltGr characters count as
+        # missing (substituted or left out).
         level3 = []
         for kc in keycodes:
             syms = ctypes.POINTER(U32)()
@@ -173,54 +171,64 @@ class XkbKeymap:
             return [self.dead[decomp[1]]] + self.keys[decomp[0]]
         return None
 
-    def plan(self, text: str) -> list[tuple[str, object]]:
-        """Split text into ("keys", [[ydotool events of one character], ...]) and
-        ("paste", str) segments."""
-        segs: list = []
+    def spell(self, ch: str) -> list | None:
+        """Strokes for one character - or for its substitute - or None."""
+        strokes = self.strokes_for(ch)
+        if strokes is not None:
+            return [strokes]
+        alt = SUBSTITUTES.get(ch) or unicodedata.normalize("NFD", ch)[0]
+        if alt != ch:
+            parts = [self.strokes_for(c) for c in alt]
+            if None not in parts:
+                return parts
+        return None
+
+    def plan(self, text: str) -> tuple[list[list[tuple[int, bool]]], str]:
+        """([key events (code, pressed) for each typed character], characters left
+        out). Modifiers are released in reverse order after each character, so Shift
+        or AltGr is never left held down between two characters."""
+        chars, dropped = [], ""
         for ch in text:
-            strokes = self.strokes_for(ch)
-            if strokes is None:
-                if segs and segs[-1][0] == "paste":
-                    segs[-1] = ("paste", segs[-1][1] + ch)
-                else:
-                    segs.append(("paste", ch))
+            spelled = self.spell(ch)
+            if spelled is None:
+                dropped += ch
                 continue
-            ev = []
-            for code, mods in strokes:
-                ev += [f"{m}:1" for m in mods] + [f"{code}:1", f"{code}:0"]
-                ev += [f"{m}:0" for m in reversed(mods)]
-            if segs and segs[-1][0] == "keys":
-                segs[-1][1].append(ev)
-            else:
-                segs.append(("keys", [ev]))
-        return segs
+            for strokes in spelled:
+                ev = []
+                for code, mods in strokes:
+                    ev += [(m, True) for m in mods] + [(code, True), (code, False)]
+                    ev += [(m, False) for m in reversed(mods)]
+                chars.append(ev)
+        return chars, dropped
 
 
 class Keyboard:
-    """Writes text into the focused window through ydotool (kernel uinput): keystrokes
-    computed for the active layout; characters the layout can't produce are pasted.
+    """Types text into the focused window, as keystrokes for the active layout, sent
+    through the RemoteDesktop portal.
+
+    remote: a portal.RemoteKeyboard (replaceable in tests). Each write() opens one
+    session and closes it afterwards.
     """
 
-    def __init__(self, layout: str | None = None, key_delay_ms: int = 4,
-                 restore_clipboard: bool = True):
-        """`gate` is called before every ydotool call and may block to pause typing.
+    def __init__(self, layout: str | None = None, key_delay_ms: int = 4, remote=None):
+        """`gate` is called before every character and may block to pause typing.
         It does nothing until the daemon sets it."""
         self.layout, self.key_delay = layout, key_delay_ms
-        self.restore_clipboard = restore_clipboard
+        self._remote = remote
         self.gate = lambda: None
         self._keymaps: dict[tuple, XkbKeymap] = {}
 
-    @staticmethod
-    def _env() -> dict:
-        """Environment for ydotool. Looked up on every call: ydotoold may be started
-        after the daemon, and its socket path depends on how it runs."""
-        env = dict(os.environ)
-        if "YDOTOOL_SOCKET" not in env:
-            for cand in (paths.RUNTIME_DIR / ".ydotool_socket", Path("/tmp/.ydotool_socket")):
-                if cand.exists():
-                    env["YDOTOOL_SOCKET"] = str(cand)
-                    break
-        return env
+    @property
+    def remote(self):
+        if self._remote is None:
+            from .portal import RemoteKeyboard
+            self._remote = RemoteKeyboard()
+        return self._remote
+
+    def check_access(self, timeout: float = 300):
+        """Open and close one session: on the first start, GNOME asks for keyboard
+        access now. Raises portal.AccessDenied if the user declines."""
+        self.remote.open(timeout=timeout).close()
 
     def keymap(self) -> XkbKeymap:
         """Keymap of the layout GNOME uses right now (cached per layout)."""
@@ -238,77 +246,19 @@ class Keyboard:
     def write(self, text: str):
         # newlines/tabs become spaces: Enter would send chat messages
         text = text.translate({ord("\n"): " ", ord("\r"): " ", ord("\t"): " "})
-        for kind, payload in self.keymap().plan(text):
-            if kind == "paste":
-                print(f"not on layout, pasting: {payload!r}", flush=True)
-                try:
-                    self.paste(payload)
-                except (OSError, subprocess.SubprocessError) as e:   # keep typing the rest
-                    print(f"  could not paste {payload!r}, skipped: {e!r}", file=sys.stderr,
-                          flush=True)
-            else:
-                self._type(payload)
-
-    def _type(self, chars: list[list[str]]):
-        """One ydotool call per character (~0.4 ms each), with the gate before each:
-        typing can pause between any two characters, and never with Shift or AltGr
-        held down."""
-        for events in chars:
-            self.gate()
-            self._keys(events, self.key_delay)
-
-    def _keys(self, events: list[str], delay_ms: int = 12):
-        subprocess.run(["ydotool", "key", "-d", str(delay_ms), *events],
-                       env=self._env(), check=True, timeout=60)
-
-    def paste(self, text: str):
-        """Shift+Insert with `text` in the clipboard and the primary selection. Both are
-        restored afterwards, also when a step fails."""
-        # gated once, before the clipboard is touched: waiting between the copy and
-        # the paste would leave the fragment in the clipboard for a whole recording
-        self.gate()
-        saved = ([(sel, self._save_selection(sel)) for sel in SELECTIONS]
-                 if self.restore_clipboard else [])
+        chars, dropped = self.keymap().plan(text)
+        if dropped:
+            print(f"  no key on this layout, left out: {dropped!r}", flush=True)
+        session = None
         try:
-            for sel in SELECTIONS:
-                subprocess.run(["wl-copy", *sel, "--type", "text/plain;charset=utf-8", "--",
-                                text], check=True, timeout=5)
-            time.sleep(0.15)                        # let the compositor see the new selection
-            self._keys(PASTE_KEYS.split())
-            time.sleep(0.5)                         # let the target app read it
+            for events in chars:
+                self.gate()
+                if session is None:                 # opened after the first gate: not
+                    session = self.remote.open(timeout=60)   # while a recording runs
+                for code, pressed in events:
+                    session.key(code, pressed)
+                    if self.key_delay:
+                        time.sleep(self.key_delay / 1000)
         finally:
-            for sel, old in saved:
-                if old is None:
-                    continue
-                mime, data = old
-                try:
-                    subprocess.run(["wl-copy", *sel, "--type", mime], input=data, timeout=5,
-                                   check=False)
-                except (OSError, subprocess.TimeoutExpired):
-                    print(f"  could not restore the {'primary selection' if sel else 'clipboard'}",
-                          flush=True)
-
-    @staticmethod
-    def _save_selection(sel: tuple = ()) -> tuple[str, bytes] | None:
-        """(mime type, data) of the clipboard (or with ("--primary",) the primary
-        selection), or None if it is empty or unreadable.
-
-        wl-copy can offer only one type, so one is chosen: copied files (GNOME's file
-        list type - file managers also offer them as text), else text, else the first
-        real mime type (an image, ...).
-        """
-        try:
-            r = subprocess.run(["wl-paste", *sel, "--list-types"], capture_output=True,
-                               text=True, timeout=2)
-            types = r.stdout.splitlines() if r.returncode == 0 else []
-            mime = (next((t for t in CLIPBOARD_FILE_TYPES if t in types), None)
-                    or next((t for t in CLIPBOARD_TEXT_TYPES if t in types), None)
-                    or next((t for t in types if "/" in t), None))
-            if mime is None:
-                return None
-            r = subprocess.run(["wl-paste", *sel, "--no-newline", "--type", mime],
-                               capture_output=True, timeout=2)
-            return (mime, r.stdout) if r.returncode == 0 else None
-        except (OSError, subprocess.TimeoutExpired):    # owner not responding / no wl-paste
-            print("  could not read the clipboard, it won't be restored", flush=True)
-            return None
+            if session is not None:
+                session.close()

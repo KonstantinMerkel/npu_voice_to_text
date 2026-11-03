@@ -71,9 +71,6 @@ def parser() -> argparse.ArgumentParser:
                         "(default: the active GNOME input source)")
     g.add_argument("--key-delay", type=int, default=4,
                    help="ms between key events (default: %(default)s)")
-    g.add_argument("--no-restore-clipboard", dest="restore_clipboard", action="store_false",
-                   help="don't restore the clipboard after pasting a character the layout "
-                        "can't type (emoji, ...)")
     g.add_argument("--no-trailing-space", dest="trailing_space", action="store_false",
                    help="don't add a space after each dictation")
     g = sv.add_argument_group("misc")

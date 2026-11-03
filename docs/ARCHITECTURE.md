@@ -14,7 +14,7 @@ keyboard ─▶ npu-voice-to-text-keywatch                  │   │ npu-voice-
                                                        │   Recorder     mic → 16 kHz mono buffer (PortAudio)  │
                                                        │   Transcriber  whisper-small, CPU → language         │
                                                        │                whisper-turbo, NPU → text             │
-                                                       │   Keyboard     text → keystrokes for your layout ────┼─▶ ydotoold ─▶ focused window
+                                                       │   Keyboard     text → keystrokes for your layout ────┼─▶ Remote Desktop portal ─▶ focused window
                                                        └─────────────────────────────────────────────────────┘
 ```
 
@@ -25,7 +25,7 @@ One dictation, step by step:
 3. **F8 up.** The watcher sends `release`. The daemon closes the mic and starts a thread for steps 4–6, so the socket stays responsive.
 4. The small Whisper model on the CPU listens to the recording and produces a single token: the language.
 5. The large Whisper model on the NPU transcribes the recording, with that language set explicitly.
-6. The text is converted into keystrokes for your current keyboard layout and sent to `ydotoold`, which types them through a virtual keyboard.
+6. The text is converted into keystrokes for your current keyboard layout and sent through GNOME's Remote Desktop portal, which types them like a second keyboard.
 
 Typical timing for a 5 s sentence: ~0.5 s language detection + ~1.6 s transcription + typing.
 
@@ -49,6 +49,7 @@ Typical timing for a 5 s sentence: ~0.5 s language detection + ~1.6 s transcript
 | `tools/microphones.py` | Lists microphones for `install.sh` |
 | `tools/remove-keywatch.sh` | Removes the key watcher (`install.sh` when switching to toggle mode, `uninstall.sh`) |
 | `$XDG_RUNTIME_DIR/npu-voice-to-text.sock` | Control socket (mode 0600) |
+| `~/.local/state/npu-voice-to-text/remote-desktop-token` | Restore token of the keyboard permission (mode 0600). Removed, and the permission revoked, by `uninstall.sh` |
 
 ### Code layout
 
@@ -59,12 +60,13 @@ One module per component. Modules marked *stdlib* import only the standard libra
 | `cli` | argparse, options file, dispatch to the commands | stdlib |
 | `client` | `request()`: one line to the socket, one line back | stdlib |
 | `paths`, `models` | XDG locations; model ids, `model_path()`, `download` | stdlib |
-| `keyboard` | `XkbKeymap` (layout → keystrokes), `Keyboard` (ydotool, clipboard) | stdlib + ctypes |
+| `keyboard` | `XkbKeymap` (layout → keystrokes, substitutes), `Keyboard` (types a text) | stdlib + ctypes |
+| `portal` | `RemoteKeyboard`: RemoteDesktop portal sessions, restore token | jeepney (D-Bus) |
 | `audio` | `speech_stats()` (speech detector), `Recorder` (PortAudio) | numpy |
 | `transcriber` | `Transcriber`: language choice, Whisper, hallucination filter | numpy, OpenVINO on `load()` |
 | `daemon` | `Daemon`: state machine, queue, worker, socket server | all of the above |
 
-**Dependencies are passed in.** `Daemon(transcriber, recorder, keyboard)` and `Transcriber(pipe, detector, …)` take their parts as arguments. `Daemon.from_args()` and `Transcriber.load()` build the real ones (NPU, microphone, ydotool). The tests pass fakes instead, so they cover the state machine, recording overlapping transcription, typing pausing while you record, language choice and the socket server without any hardware. The keymap tests use the real libxkbcommon, so they check the actual German and US layouts.
+**Dependencies are passed in.** `Daemon(transcriber, recorder, keyboard)` and `Transcriber(pipe, detector, …)` take their parts as arguments. `Daemon.from_args()` and `Transcriber.load()` build the real ones (NPU, microphone, portal). The tests pass fakes instead, so they cover the state machine, the portal's request flow (against a fake D-Bus connection), recording overlapping transcription, typing pausing while you record, language choice and the socket server without any hardware. The keymap tests use the real libxkbcommon, so they check the actual German and US layouts.
 
 The key watcher stays a single standalone script outside the package: root runs a root-owned copy of it, and it must not import anything from a user-writable venv.
 
@@ -100,7 +102,7 @@ The unit hardening (`CapabilityBoundingSet=CAP_DAC_OVERRIDE`, `ProtectSystem=str
 | `cancel` | stop recording and discard it | `cancelled` |
 | `status` | | `idle`, `recording`, `transcribing N` or `recording, transcribing N` |
 
-`npu-voice-to-text press|release|toggle|cancel|status` is the client. It only imports the standard library, so it reacts instantly when bound to a shortcut. A press while the previous dictation is still being transcribed starts the next recording right away. Recordings are transcribed and typed one at a time, in order, so two dictations never type over each other. Text is only typed while no recording runs: with RIGHTCTRL or RIGHTMETA as the hold key, typing while the key is held would turn the characters into shortcuts. Typing therefore pauses when a recording starts. It runs one `ydotool` call per character (about 0.4 ms each) and checks before each one, so it pauses between whole characters and never leaves Shift or AltGr held down. Only the character being typed at the moment of the key press can still be hit (about 20 ms). A `toggle` after the 120 s limit already stopped the recording doesn't start a new one.
+`npu-voice-to-text press|release|toggle|cancel|status` is the client. It only imports the standard library, so it reacts instantly when bound to a shortcut. A press while the previous dictation is still being transcribed starts the next recording right away. Recordings are transcribed and typed one at a time, in order, so two dictations never type over each other. Text is only typed while no recording runs: with RIGHTCTRL or RIGHTMETA as the hold key, typing while the key is held would turn the characters into shortcuts. Typing therefore pauses when a recording starts. It checks before each character, so it pauses between whole characters and never leaves Shift or AltGr held down. Only the character being typed at the moment of the key press can still be hit (a few ms). A `toggle` after the 120 s limit already stopped the recording doesn't start a new one.
 
 Why a socket and not D-Bus or signals: it needs no extra dependencies, the permissions are simply file permissions, and root (the key watcher) can reach it without joining your session bus.
 
@@ -139,14 +141,19 @@ Comparing how confident the model is with each language forced (de vs en) would 
 
 ### Keyboard (text output)
 
-Wayland doesn't let one app type into another. `ydotool` works around that one level lower: `ydotoold` (root) creates a virtual keyboard through the kernel's `uinput`, and the compositor treats it like a real USB keyboard.
+**How text gets into another window.** Wayland doesn't let one app type into another. The sanctioned way is the [RemoteDesktop portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html) (`portal.py`, D-Bus through the pure-Python `jeepney`):
+1. `CreateSession`, `SelectDevices` (keyboard only, `persist_mode=2`: until revoked), `Start`. The first time, GNOME shows a dialog and the user allows keyboard access. The portal stores that in its permission store (table `remote-desktop`, keyed by a *restore token*) and returns the token. npu-voice-to-text keeps it in `~/.local/state/npu-voice-to-text/remote-desktop-token` (0600). A token is single-use: each `Start` returns the next one, which replaces it.
+2. With the token, `Start` succeeds without a dialog in ~20 ms. So each dictation opens its own session, types, and closes it: a session, and anything GNOME shows for it, only exists while text is typed.
+3. Keys are sent with `NotifyKeyboardKeycode` (evdev codes, one D-Bus call per key event). The compositor interprets them with the active layout, exactly like a real keyboard.
 
-**ydotool only sends key codes, not characters.** Its own `type` command assumes a US layout. On German that turns `y` into `z`, and umlauts don't work at all. So npu-voice-to-text computes the key codes itself:
+The daemon opens one session at startup. On the first start that is when the dialog appears (during `install.sh`). If the user declines, the daemon exits with status 3, and the unit doesn't restart on it (`RestartPreventExitStatus=3`), so the dialog doesn't come back every 5 s. `install.sh` reports it. `uninstall.sh` deletes the permission (`PermissionStore.Delete remote-desktop <token>`), so a reinstall asks again.
+
+**Why key codes, not characters.** The portal also has `NotifyKeyboardKeysym` ("type this character"), but mutter only types keysyms that the active layout has *directly*: in a test on GNOME 50 with a German layout, `ä ö ü ß € @ „ “ –` arrived; `é è ê` (dead keys), `…` (Shift+AltGr level), `ñ ç` and emoji were dropped. libei (`ConnectToEIS`) is no different: it sends key codes on the compositor's keymap. So npu-voice-to-text computes the key codes itself:
 1. It reads the active input source from GNOME (`gsettings org.gnome.desktop.input-sources`), e.g. `de`.
 2. It compiles that layout with **libxkbcommon** (via `ctypes`), the same library GNOME uses to turn key codes into characters.
-3. It walks every key and every shift level and records which key code + Shift/AltGr produces each character. AltGr is whichever key produces `ISO_Level3_Shift` in that keymap: Right Alt normally, another key with options like `lv3:caps_switch`. If options like `compose:ralt` leave no real key for it (xkb's virtual `<LVL3>` key doesn't count, since `ydotoold` can't send it), AltGr characters are pasted. It only uses the main typing block (plus space, `<>|`, and the Japanese/Brazilian RO and YEN keys). Characters only found on the keypad or on exotic keys like `KEY_EURO` (€ on `us`) are pasted instead, because many apps ignore those keys. If several keys produce the same character, it prefers fewer modifiers.
-4. It also records **dead keys** (`´`, `` ` ``, `^`, …). A character with no key of its own is split with Unicode NFD (`é` → `e` + U+0301) and typed as dead key + base letter. A bare `^` is dead key + space.
-5. Characters the layout can't produce at all are pasted. On German that is only emoji and a few rare ones (`ñ`, `œ`, `•`); on a US layout also umlauts, `ß`, `€` and typographic quotes and dashes. The text goes into **both** the clipboard and the primary selection (`wl-copy` and `wl-copy --primary`), and **Shift+Insert** is pressed. Apps (GTK, Qt, browsers, Electron, LibreOffice) paste the clipboard on Shift+Insert, terminals (VTE, kitty, foot, Alacritty) paste the primary selection, so one shortcut works everywhere. Ctrl+V doesn't, because terminals need Ctrl+Shift+V. Both selections are restored afterwards, also when the paste fails. `wl-copy` can only offer one type, so one is restored: GNOME's file list if files were copied, otherwise text, otherwise the first type (an image, …).
+3. It walks every key and every shift level and records which key code + Shift/AltGr produces each character. AltGr is whichever key produces `ISO_Level3_Shift` in that keymap: Right Alt normally, another key with options like `lv3:caps_switch`. If options like `compose:ralt` leave no real key for it (xkb's virtual `<LVL3>` key doesn't count, no keyboard has it), AltGr characters count as missing. It only uses the main typing block (plus space, `<>|`, and the Japanese/Brazilian RO and YEN keys). Characters only found on the keypad or on exotic keys like `KEY_EURO` (€ on `us`) count as missing, because many apps ignore those keys. If several keys produce the same character, it prefers fewer modifiers.
+4. It also records **dead keys** (`´`, `` ` ``, `^`, …). A character with no key of its own is split with Unicode NFD (`é` → `e` + U+0301) and typed as dead key + base letter. A bare `^` is dead key + space. With key codes this works (the test above typed `é è ê ç …` correctly).
+5. **Characters the layout has no key for are replaced**, never pasted: `ä ö ü ß` → `ae oe ue ss`, typographic quotes → `"` / `'`, dashes → `-`, `…` → `...`, `€` → `EUR` (`SUBSTITUTES` in `keyboard.py`), otherwise the letter without its accent (`ñ` → `n`). What is left - emoji, which speech recognition doesn't produce - is left out and logged. On a German layout nothing German or English needs a substitute; on a US layout, German text gets `ae`/`oe`/`ue`/`ss`.
 
 Newlines become spaces (Enter would send chat messages). Events are sent 4 ms apart, which is roughly 1 s for 50 words. A few apps need `--key-delay 8`.
 
@@ -181,7 +188,9 @@ How to check the NPU is really used: `cat /sys/bus/pci/devices/0000:00:0b.0/npu_
 |---|---|
 | **Handy, Vocalinux, …** (existing apps) | No NPU support. On GNOME Wayland, Handy's text output didn't work in practice. |
 | **IBus input method** for output | Needs a system-wide component and its own input source you'd switch to. Electron apps often ignore IBus on Wayland. Simulated keystrokes work wherever a real keyboard works. |
-| **Clipboard + paste as an output mode** (`--output paste`, removed) | Overwrites the clipboard and needs a different shortcut in terminals (`--paste-keys`, also removed). Typing works everywhere a keyboard works; pasting is only the fallback for characters the layout lacks, through Shift+Insert (see Keyboard). |
+| **ydotool** (used until 0.2) | Needs `ydotoold`, a root daemon whose socket can type anything, set up by hand. The portal does the same with the user's consent and nothing to set up. |
+| **Clipboard + paste** (as an output mode, or as the fallback for characters the layout lacks) | Overwrites the clipboard, terminals need a different shortcut, and restoring the clipboard is fragile. Dictation produces German and English text, which every layout can type with a few substitutes (`ä` → `ae` on a US layout). |
+| **Keysyms** (`NotifyKeyboardKeysym`) or **libei** | Only reach what the layout has directly - no dead keys, no Shift+AltGr level (see Keyboard). |
 | **User in the `input` group** | Lets every program you run read every keystroke. See the key watcher above. |
 | **Live text while speaking** (re-transcribe every ~1.6 s, type words two passes agree on, fix the rest with Backspace) | Built and tried. Whisper isn't a streaming model and each NPU pass has a fixed ~1.6 s cost, so words appeared 3–5 s late and were then visibly corrected. Removed in favour of one clean result on release. |
 | **Streaming models** (NVIDIA Nemotron 3.5 ASR Streaming, ~0.3 s latency, German and English) | A promising future option, but: no tested NPU build with small chunks, and noticeably more errors than Whisper turbo. Not worth it for now. |
@@ -192,7 +201,7 @@ How to check the NPU is really used: `cat /sys/bus/pci/devices/0000:00:0b.0/npu_
 
 - Text goes to the window that has focus **at release**, not at press.
 - The mic opens on press, so the first ~100 ms may be cut. Start speaking a moment after pressing.
-- Caps Lock inverts typed letters (ydotool types keys, not characters).
+- Caps Lock inverts typed letters (keys are sent, not characters).
 - Only one layout group: the first one of the active input source.
 - Tested only on one Arrow Lake laptop with Fedora 44.
 
@@ -200,7 +209,7 @@ How to check the NPU is really used: `cat /sys/bus/pci/devices/0000:00:0b.0/npu_
 
 ## Roadmap
 
-**Goal: no root component and no ydotool.** Both are workarounds for things Wayland now offers through desktop portals: global shortcuts with press *and* release, and input injection with the user's consent. Both portals are D-Bus APIs, so they would share one small `portal.py` module (session handling and the portal's Request/Response pattern, with a pure-Python D-Bus library such as `jeepney`). Each one is added behind an option first. The current mechanism stays as the fallback until the portal version has proven itself on real use.
+**Goal: no root component.** The root key watcher is a workaround for something Wayland now offers through a desktop portal: global shortcuts with press *and* release. Typing already moved from ydotool to the RemoteDesktop portal (done, see Keyboard); its `portal.py` (session handling, the portal's Request/Response pattern, `jeepney`) is the base for the GlobalShortcuts portal too.
 
 ### 1. Hold key: GlobalShortcuts portal (replaces the root key watcher)
 
@@ -217,20 +226,9 @@ To find out first (a short spike):
 - **Which triggers are allowed.** A lone RIGHTCTRL probably isn't. Those keys would keep the key watcher, or be dropped.
 - **Lifecycle.** The session is tied to the D-Bus connection, so it is re-created after a daemon restart (the binding itself persists).
 
-### 2. Typing: RemoteDesktop portal / libei (replaces ydotool)
+### ~~2. Typing: RemoteDesktop portal (replaces ydotool)~~ - done
 
-[`org.freedesktop.portal.RemoteDesktop`](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html):
-
-1. `CreateSession`, then `SelectDevices` (keyboard, `persist_mode=2`), then `Start`. GNOME asks once for permission. The returned `restore_token` skips the dialog next time. It is single-use, so the new token from every `Start` is saved.
-2. Typing: either `NotifyKeyboardKeysym` (plain D-Bus, one call per key event) or `ConnectToEIS` for a libei connection (lower latency, and the compositor sends its keymap).
-
-What it removes: `ydotoold` (a root daemon whose socket can type anything), its setup in the README, the socket lookup, and one subprocess per character. With **keysyms** the compositor finds the key on the *current* layout. Most of `XkbKeymap`'s reverse mapping, the gsettings layout lookup, the AltGr detection and the Caps Lock limitation could then go away.
-
-To find out first:
-- **Keysyms not on the layout** (emoji, `ñ` on German): does mutter type them, or drop them? If it drops them, the clipboard fallback stays, and something still has to know what the layout can type. libei's keymap from the compositor would be the right source for that, rather than gsettings.
-- **Dead-key characters** (`é` on German): does mutter compose them from a keysym, or must we still send dead key + letter?
-- **The "remote desktop" indicator.** GNOME shows it while a session is open. Is a session kept open for the daemon's lifetime acceptable, or does it need one session per dictation (slower)?
-- The keymap tests in `tests/test_keyboard.py` are the spec: on German, `y`/`z`, `ä ö ü ß`, `@ €`, `„“` and `é` must still come out right.
+Implemented with key codes, see Keyboard. The open questions were answered by testing on GNOME 50: keysyms only reach what the layout has directly (no dead keys, no Shift+AltGr level, nothing off the layout), so key codes computed with libxkbcommon stay; characters the layout lacks are replaced instead of pasted; one short session per dictation means no session stays open between dictations.
 
 ### Smaller items
 

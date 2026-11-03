@@ -25,6 +25,7 @@ SOUND_STOP = "/usr/share/sounds/freedesktop/stereo/device-removed.oga"
 SOUND_START_SKIP = 0.4     # seconds of audio dropped after the start sound (0.22 s + latency)
 SILENT_START_WARNING = 0.3  # seconds of digital silence at the start worth a warning
 CLIENT_TIMEOUT = 2.0        # seconds a client may take to send its command
+EXIT_NO_KEYBOARD = 3        # keyboard access declined: the unit doesn't restart on it
 
 
 class Daemon:
@@ -59,14 +60,23 @@ class Daemon:
 
     @classmethod
     def from_args(cls, args) -> "Daemon":
-        """The real daemon: models on the NPU/CPU, the microphone, ydotool."""
+        """The real daemon: models on the NPU/CPU, the microphone, the portal."""
         t0 = time.monotonic()
+        keyboard = Keyboard(args.layout, args.key_delay)
+        # first, so the GNOME dialog shows up right away on the first start (install)
+        print("checking keyboard access (the first start asks for it in a GNOME dialog)",
+              flush=True)
+        try:
+            keyboard.check_access()
+        except Exception as e:                      # declined, ignored, or no portal
+            print(f"no keyboard access: {e}\n  re-run ./install.sh to be asked again",
+                  file=sys.stderr, flush=True)
+            sys.exit(EXIT_NO_KEYBOARD)              # systemd doesn't restart on this one
         languages = [lang_code(x) for x in args.languages.split(",") if x.strip()]
         transcriber = Transcriber.load(
             args.model, args.device, args.detect_model, args.detect_device, languages,
             lang_code(args.fallback_language), args.language and lang_code(args.language))
         recorder = Recorder(args.input_device)
-        keyboard = Keyboard(args.layout, args.key_delay, args.restore_clipboard)
         daemon = cls(transcriber, recorder, keyboard, sounds=args.sounds,
                      trailing_space=args.trailing_space)
         lang = (f"forced {args.language}" if args.language else

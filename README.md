@@ -5,8 +5,8 @@ Hold-to-talk dictation for GNOME on Wayland. The speech recognition runs locally
 Hold a key (F8 by default), speak German or English, release. About two seconds later the text is typed into whatever window has focus.
 
 - **Offline.** Whisper large-v3-turbo runs on the NPU via [OpenVINO GenAI](https://github.com/openvinotoolkit/openvino.genai). Nothing leaves the machine, and the CPU and GPU stay free.
-- **Works on Wayland.** Text is typed through [ydotool](https://github.com/ReimuNotMoe/ydotool) (kernel uinput), so Wayland doesn't block it. Your clipboard is only used for the rare character your layout has no key for (emoji, for example), and restored right after.
-- **Correct characters on any layout.** The keystrokes are computed from your active GNOME layout with libxkbcommon. On a German layout, `y`/`z`, `ä ö ü ß`, `€`, `@`, `„“` and dead-key accents (`é`) come out right.
+- **Works on Wayland, the sanctioned way.** Text is typed through GNOME's Remote Desktop portal, with keyboard access you allow once in a GNOME dialog. No ydotool, no clipboard.
+- **Correct characters on any layout.** The keystrokes are computed from your active GNOME layout with libxkbcommon. On a German layout, `y`/`z`, `ä ö ü ß`, `€`, `@`, `„“` and dead-key accents (`é`) come out right. Characters your layout has no key for are replaced: on a US layout `ä` becomes `ae`, `„“` become `"`.
 - **German and English, detected per recording.** Other languages fall back to English. Single words, which Whisper can't identify, keep the language of your previous dictation.
 
 > **Status:** personal project, tested on one machine: ThinkPad E14 Gen 7, Core Ultra 7 255H (Arrow Lake, NPU 3720), Fedora 44, GNOME 50, kernel 7.2. Other Core Ultra generations (Meteor Lake, Lunar Lake, Panther Lake) and distributions should work, but are untested.
@@ -18,32 +18,20 @@ Hold a key (F8 by default), speak German or English, release. About two seconds 
 |---|---|
 | Intel Core Ultra CPU with NPU | `/dev/accel/accel0` must exist (kernel driver `intel_vpu`, in mainline since 6.3) and be read/writable for you. |
 | NPU firmware | From your distro (`intel-npu-firmware` on Fedora, `linux-firmware` elsewhere). |
-| GNOME on Wayland | The layout is read from GNOME settings. Other desktops: pass `--layout`. |
+| GNOME on Wayland | Typing uses the Remote Desktop portal (`xdg-desktop-portal-gnome`, installed with GNOME). The layout is read from GNOME settings. |
 | Python 3.10+ | |
-| System libraries | Level Zero loader, oneTBB, PortAudio, libxkbcommon, `wl-clipboard`, `ydotool`, `binutils` (for `ar`) |
+| System libraries | Level Zero loader, oneTBB, PortAudio, libxkbcommon, `binutils` (for `ar`) |
 
 ```bash
 # Fedora
-sudo dnf install oneapi-level-zero tbb portaudio libxkbcommon wl-clipboard ydotool binutils
+sudo dnf install oneapi-level-zero tbb portaudio libxkbcommon binutils
 # Ubuntu / Debian
-sudo apt install libze1 libtbb12 libportaudio2 libxkbcommon0 wl-clipboard ydotool binutils
+sudo apt install libze1 libtbb12 libportaudio2 libxkbcommon0 binutils
 ```
 
 You don't need distro OpenVINO or NPU-compiler packages. `install.sh` fetches the exact versions that work together. Fedora's `intel-npu-compiler`, for example, is too old for current OpenVINO, and it pulls in about 8 GB of dependencies.
 
-### ydotool
-
-`ydotoold` must run, and its socket must be writable by your user. On Fedora, let the shipped service create the socket owned by you (keyboard only, no mouse):
-
-```bash
-sudo systemctl edit ydotool       # add:
-#   [Service]
-#   ExecStart=
-#   ExecStart=/usr/bin/ydotoold --socket-path=/tmp/.ydotool_socket --socket-own=1000:1000 --mouse-off
-sudo systemctl enable --now ydotool
-```
-
-Replace `1000:1000` with the output of `id -u`:`id -g`. Whoever can write to this socket can type into your session, so don't make it world-writable (`chmod 666`). `npu-voice-to-text` looks for the socket at `$YDOTOOL_SOCKET`, `$XDG_RUNTIME_DIR/.ydotool_socket` or `/tmp/.ydotool_socket`.
+Earlier versions typed through ydotool. It isn't needed any more: if you set up `ydotoold` only for npu-voice-to-text, you can disable it (`sudo systemctl disable --now ydotool`).
 
 
 ## Install
@@ -60,7 +48,7 @@ The installer:
 4. checks that OpenVINO sees the NPU;
 5. downloads the two Whisper models (~1.1 GB);
 6. asks for the **preferred microphone** (or none). It's used while connected; otherwise, or with none, dictation records from the system default mic set in your desktop's sound settings. With none, dictation follows that default, also to Bluetooth earbuds when they connect, so the installer suggests a wired or built-in mic. Avoid Bluetooth headsets: opening their mic switches them into headset mode, which takes ~1 s, so the start of every dictation (or a whole single word) is lost. Empty jacks are marked.
-7. starts the systemd user service and waits until it's ready. The first start compiles the model for the NPU, which takes a few minutes.
+7. starts the systemd user service and waits until it's ready. On the very first start, **GNOME asks whether to allow keyboard access** ("Remote Desktop" dialog). Allow it, otherwise nothing can be typed; see [Privacy and security](#privacy-and-security) for what exactly that allows. The first start also compiles the model for the NPU, which takes a few minutes.
 8. asks for the **mode** and the **key**:
    - **hold-to-talk** (default): hold the key while speaking. Needs a small root service that reads the keyboards (sudo, see [Privacy and security](#privacy-and-security)).
    - **toggle**: press the key to start, press it again to stop. A plain GNOME shortcut, no root.
@@ -101,7 +89,6 @@ Options go into `~/.config/npu-voice-to-text/options`, one per line (`#` comment
 | `--device` | `NPU` | `GPU` or `CPU` also work |
 | `--layout` | active GNOME layout | e.g. `de+nodeadkeys`, for non-GNOME desktops |
 | `--key-delay` | `4` | ms between key events. Raise it if an app drops characters. |
-| `--no-restore-clipboard` | | Don't restore the clipboard after pasting a character your layout can't type |
 | `--no-trailing-space` | | Don't add a space after each dictation |
 | `--input-device` | set by `install.sh` | Preferred microphone: a PipeWire source name from `pactl list sources short`. Used while connected, otherwise the system default. |
 | `--sounds` | | Start/stop sounds. The first 0.4 s of each recording (the start sound) is dropped, so start speaking after it |
@@ -118,7 +105,7 @@ key down/up ─▶ npu-voice-to-text-keywatch (root) ─▶ socket ─▶ npu-vo
                                                           │   whisper-small on CPU → language
                                                           │   whisper-turbo on NPU → text
                                                           ▼
-                                     ydotool ─▶ keystrokes for your layout ─▶ focused window
+              Remote Desktop portal ─▶ keystrokes for your layout ─▶ focused window
 ```
 
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) explains every component and the reasons behind each decision.
@@ -129,7 +116,7 @@ key down/up ─▶ npu-voice-to-text-keywatch (root) ─▶ socket ─▶ npu-vo
 - Audio is processed locally and never stored. Transcripts appear in your user journal (`journalctl --user -u npu-voice-to-text`).
 - **The key watcher runs as root**, because reading `/dev/input` needs root or the `input` group. Membership in `input` would let every program you run read all your keystrokes. The watcher is ~100 lines of standard-library Python. It forwards only press/release of one key, and the systemd unit drops every capability except the one needed to reach your socket.
 - The daemon socket is `0600`, so only you (and root) can start a recording.
-- ydotool can type anything. Keep its socket owned by you (see above).
+- **Keyboard access.** In GNOME's dialog you allow npu-voice-to-text to send key presses to the window that has focus, the way a second keyboard would. Only the keyboard is requested: no mouse, no screen sharing. GNOME stores the permission (table `remote-desktop` of its permission store) under a secret restore token, which npu-voice-to-text keeps in `~/.local/state/npu-voice-to-text/remote-desktop-token` (mode `0600`). With the token, later dictations need no dialog. Programs not sandboxed by Flatpak run as you and could read that file, the same trust level as anything else in your home directory. `./uninstall.sh` revokes the permission; to revoke it by hand: `gdbus call --session --dest org.freedesktop.impl.portal.PermissionStore --object-path /org/freedesktop/impl/portal/PermissionStore --method org.freedesktop.impl.portal.PermissionStore.Delete remote-desktop "$(cat ~/.local/state/npu-voice-to-text/remote-desktop-token)"`.
 
 
 ## Troubleshooting
@@ -141,8 +128,9 @@ key down/up ─▶ npu-voice-to-text-keywatch (root) ─▶ socket ─▶ npu-vo
 | Holding the key does nothing | `journalctl -u npu-voice-to-text-keywatch@$(id -u)` should list your keyboards, and `journalctl --user -u npu-voice-to-text -f` should show `command: press`. On laptops, the F-keys are often media keys: use Fn or FnLock, or pick another key. |
 | Short words get lost, or the start of sentences is missing | The log says `warning: the microphone delivered nothing for the first …s`. Typically that's a Bluetooth headset switching modes. Set another preferred mic with `./install.sh`, or change the system default. |
 | "Nothing heard" although you spoke | Check the log line `[… speech, peak …]`. A peak below ~0.005 means the mic is too quiet or muted (a laptop's built-in mic with the lid closed, for example). Pick another mic or raise its input volume. |
-| Nothing typed / wrong window | Check `ydotool key 42:1 42:0` and `systemctl status ydotool`. Text goes to the window focused at **release**. |
-| Wrong characters | The log prints `keymap <layout>`. Set `--layout` if that's wrong. Check that Caps Lock is off. |
+| Nothing typed / wrong window | The log should not say `no keyboard access`. If it does (dialog declined or revoked), re-run `./install.sh` and allow it. Text goes to the window focused at **release**. |
+| The installer says `no keyboard access` | The GNOME dialog was declined or left open for 5 min. Re-run `./install.sh`. |
+| Wrong characters | The log prints `keymap <layout>`. Set `--layout` if that's wrong. Check that Caps Lock is off. Characters your layout has no key for are replaced (`ä` → `ae`) or, like emoji, left out (`no key on this layout, left out: …` in the log). |
 | Characters missing | Raise `--key-delay` to 8–12. |
 | English comes out as German | Don't use `--language`. See also Known issues. |
 | "Untertitel der Amara.org-Community" etc. | A Whisper hallucination on silence. Add it to `HALLUCINATIONS` in `src/npu_voice_to_text/transcriber.py` and re-run `./install.sh`. |
@@ -157,10 +145,10 @@ key down/up ─▶ npu-voice-to-text-keywatch (root) ─▶ socket ─▶ npu-vo
 
 ## Development
 
-The program is the Python package in `src/npu_voice_to_text/` (one module per component, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#files)). The tests need neither the NPU, OpenVINO nor a microphone, only `numpy` and libxkbcommon:
+The program is the Python package in `src/npu_voice_to_text/` (one module per component, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#files)). The tests need neither the NPU, OpenVINO nor a microphone, only `numpy`, `jeepney` and libxkbcommon:
 
 ```bash
-uvx --with numpy pytest
+uvx --with numpy --with jeepney pytest
 # or with the installed venv:
 ~/.local/share/npu-voice-to-text/venv/bin/pip install pytest
 ~/.local/share/npu-voice-to-text/venv/bin/python -m pytest
@@ -172,7 +160,7 @@ After a change, re-run `./install.sh`. It builds the package from a fresh copy o
 ## Uninstall
 
 ```bash
-./uninstall.sh          # keeps venv, NPU libs and models
+./uninstall.sh          # revokes the keyboard access; keeps venv, NPU libs and models
 ./uninstall.sh --all    # removes everything
 ```
 

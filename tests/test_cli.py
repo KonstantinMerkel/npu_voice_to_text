@@ -22,7 +22,7 @@ def test_options_file(tmp_path, monkeypatch):
 def test_missing_options_file(tmp_path, monkeypatch):
     monkeypatch.setattr(paths, "OPTIONS_FILE", tmp_path / "none")
     args = cli.parse_args(["serve"])
-    assert args.device == "NPU" and args.restore_clipboard and args.trailing_space
+    assert args.device == "NPU" and args.key_delay == 4 and args.trailing_space
 
 
 def test_options_file_is_only_for_serve(tmp_path, monkeypatch):

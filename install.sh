@@ -25,6 +25,7 @@ DATA=${XDG_DATA_HOME:-$HOME/.local/share}/npu-voice-to-text
 BIN=$HOME/.local/bin
 UNITS=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
 OPTIONS=${XDG_CONFIG_HOME:-$HOME/.config}/npu-voice-to-text/options
+TOKEN=${XDG_STATE_HOME:-$HOME/.local/state}/npu-voice-to-text/remote-desktop-token
 KEYWATCH_UNIT=/etc/systemd/system/npu-voice-to-text-keywatch@.service
 KEYWATCH_ENV=/etc/npu-voice-to-text/keywatch-$(id -u).env
 
@@ -41,7 +42,7 @@ step "Checking requirements"
 [[ -e /dev/accel/accel0 ]] || die "no NPU found (/dev/accel/accel0). Needs an Intel Core Ultra CPU and the intel_vpu kernel driver."
 [[ -r /dev/accel/accel0 && -w /dev/accel/accel0 ]] || die "/dev/accel/accel0 is not read/writable for you (normally group 'render')."
 missing=()
-for cmd in python3 curl ar tar ydotool wl-copy wl-paste gsettings; do
+for cmd in python3 curl ar tar gsettings gdbus; do
     command -v "$cmd" >/dev/null || missing+=("$cmd")
 done
 has_lib libze_loader.so.1    || missing+=("Level Zero loader (Fedora: oneapi-level-zero, Ubuntu: libze1)")
@@ -50,8 +51,6 @@ has_lib libportaudio.so.2    || missing+=("PortAudio (Fedora: portaudio, Ubuntu:
 has_lib libxkbcommon.so.0    || missing+=("libxkbcommon")
 (( ${#missing[@]} == 0 )) || die "missing: ${missing[*]}"
 ok "NPU, tools and libraries found"
-if pgrep -x ydotoold >/dev/null; then ok "ydotoold is running"
-else warn "ydotoold is not running - nothing can be typed until it is (see README)"; fi
 
 # --------------------------------------------------------------------------- #
 step "Python environment"
@@ -188,13 +187,26 @@ step "Service"
 install -Dm644 "$SRC/systemd/npu-voice-to-text.service" "$UNITS/npu-voice-to-text.service"
 systemctl --user daemon-reload
 systemctl --user enable --quiet npu-voice-to-text
+if [[ ! -s $TOKEN ]]; then
+    cat <<'EOF'
+    To type the dictated text into other windows, npu-voice-to-text asks GNOME for
+    keyboard access (the "Remote Desktop" portal). A GNOME dialog appears in a moment:
+    please allow it. Only the keyboard is requested - no mouse, no screen sharing.
+    GNOME remembers the answer; ./uninstall.sh revokes it again.
+EOF
+fi
 systemctl --user restart npu-voice-to-text
 restarts=$(systemctl --user show -p NRestarts --value npu-voice-to-text)
 printf '    starting (the first start compiles the model for the NPU, up to a few minutes) '
 for (( i = 0; ; i++ )); do
     "$BIN/npu-voice-to-text" status -q && break
-    systemctl --user is-failed -q npu-voice-to-text &&
-        { echo; die "the service failed - see: journalctl --user -u npu-voice-to-text"; }
+    if systemctl --user is-failed -q npu-voice-to-text; then
+        echo
+        # exit status 3: keyboard access declined (or the dialog was left unanswered)
+        [[ $(systemctl --user show -p ExecMainStatus --value npu-voice-to-text) == 3 ]] &&
+            die "no keyboard access - re-run ./install.sh and allow it in the GNOME dialog"
+        die "the service failed - see: journalctl --user -u npu-voice-to-text"
+    fi
     # Restart=on-failure every 5 s never hits systemd's start limit, so a crash loop
     # never shows as "failed" - look at the restart counter instead
     (( $(systemctl --user show -p NRestarts --value npu-voice-to-text) == restarts )) ||

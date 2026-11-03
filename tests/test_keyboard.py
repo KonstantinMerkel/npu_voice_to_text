@@ -1,7 +1,6 @@
-"""Text -> keystrokes. Uses the system's libxkbcommon and xkb data, but no ydotool."""
+"""Text -> keystrokes. Uses the system's libxkbcommon and xkb data; the portal is faked."""
 
 import ctypes.util
-import subprocess
 
 import pytest
 
@@ -81,112 +80,122 @@ def test_unknown_layout_raises():
         XkbKeymap("no-such-layout-xyz")
 
 
-def test_plan_splits_typed_and_pasted(de):
-    plan = de.plan("Aä😀ñb")
-    assert [kind for kind, _ in plan] == ["keys", "paste", "keys"]
-    assert plan[0][1] == [["42:1", "30:1", "30:0", "42:0"], ["40:1", "40:0"]]
-    assert plan[1] == ("paste", "😀ñ")                 # neighbours share one paste
-    assert plan[2][1] == [["48:1", "48:0"]]
+def test_plan_events(de):
+    chars, dropped = de.plan("Aä")
+    assert chars == [[(SHIFT, True), (A, True), (A, False), (SHIFT, False)],
+                     [(APOSTROPHE, True), (APOSTROPHE, False)]]
+    assert dropped == ""
 
 
 def test_plan_releases_modifiers_in_reverse(de):
-    [(kind, [events])] = de.plan("@")
-    assert events == ["100:1", "16:1", "16:0", "100:0"]
+    [events], _ = de.plan("@")
+    assert events == [(ALTGR, True), (Q, True), (Q, False), (ALTGR, False)]
+
+
+def typed(keymap, text):
+    """What a plan types, read back through the keymap."""
+    by_strokes = {tuple(s): ch for ch, s in keymap.keys.items()}
+    chars, dropped = keymap.plan(text)
+    out = ""
+    for events in chars:
+        strokes, mods, pressed = [], [], set()
+        for code, down in events:
+            if down:
+                pressed.add(code)
+                if code in (SHIFT, ALTGR, CAPS):
+                    mods.append(code)
+                else:
+                    strokes.append((code, tuple(m for m in (ALTGR, SHIFT, CAPS) if m in mods)))
+            else:
+                pressed.discard(code)
+                if code in mods:
+                    mods.remove(code)
+        out += by_strokes.get(tuple(strokes), "?")
+        assert not pressed, "a key was left pressed"
+    return out, dropped
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("Mädchen, Grüße!", "Maedchen, Gruesse!"),
+    ("„Zitat“ – ok…", '"Zitat" - ok...'),
+    ("café señor", "cafe senor"),
+    ("5 €", "5 EUR"),
+])
+def test_us_layout_substitutes(us, text, expected):
+    assert typed(us, text) == (expected, "")
+
+
+def test_german_layout_needs_no_substitutes(de):
+    text = "Mädchen „Grüße“ – Straße, 5 € @ café… ÄÖÜ"
+    chars, dropped = de.plan(text)
+    assert dropped == "" and len(chars) == len(text)   # one entry per character: none replaced
+
+
+def test_emoji_and_unknown_are_left_out(de, us):
+    for keymap in (de, us):
+        _, dropped = keymap.plan("ok 😀👍 ✓")
+        assert dropped == "😀👍✓"
+    assert typed(de, "señor")[0] == "senor"
 
 
 # --------------------------------------------------------------------------- #
-# Keyboard.write, with ydotool and the clipboard replaced by recorders
+# Keyboard.write, with the portal replaced by a recorder
 # --------------------------------------------------------------------------- #
-class Recording(Keyboard):
-    def __init__(self, **kw):
-        super().__init__(layout="de", **kw)
-        self.calls = []
-        self.gate = lambda: self.calls.append(("gate",))
+class FakeSession:
+    def __init__(self, log):
+        self.log = log
 
-    def _keys(self, events, delay_ms=12):
-        self.calls.append(("keys", tuple(events)))
+    def key(self, code, pressed):
+        self.log.append(("key", code, pressed))
 
-    def paste(self, text):
-        self.calls.append(("paste", text))
+    def close(self):
+        self.log.append(("close",))
 
 
-def test_write_gates_every_character():
-    k = Recording()
-    k.write("ab")
-    assert k.calls == [("gate",), ("keys", ("30:1", "30:0")),
-                       ("gate",), ("keys", ("48:1", "48:0"))]
+class FakeRemote:
+    def __init__(self):
+        self.log = []
 
-
-def test_write_turns_newlines_into_spaces():
-    k = Recording()
-    k.write("a\nb")
-    keys = [c[1] for c in k.calls if c[0] == "keys"]
-    assert keys[1] == ("57:1", "57:0")
-
-
-def test_write_pastes_what_the_layout_lacks():
-    k = Recording()
-    k.write("a😀")
-    assert ("paste", "😀") in k.calls
-
-
-class FakeWayland:
-    """wl-copy / wl-paste / ydotool stand-in: two selections and a log of key presses."""
-
-    def __init__(self, clipboard=b"mine", primary=b"selected", keys_fail=False):
-        self.sel = {(): clipboard, ("--primary",): primary}
-        self.keys, self.keys_fail = [], keys_fail
-
-    def run(self, cmd, input=None, **kw):
-        prog, *args = cmd
-        primary = ("--primary",) if "--primary" in args else ()
-        if prog == "ydotool":
-            if self.keys_fail:
-                raise subprocess.CalledProcessError(1, cmd)
-            self.keys.append(" ".join(args[3:]))
-            return subprocess.CompletedProcess(cmd, 0, "", b"")
-        if prog == "wl-paste" and "--list-types" in args:
-            out = "text/plain;charset=utf-8\n" if self.sel[primary] is not None else ""
-            return subprocess.CompletedProcess(cmd, 0 if out else 1, out, "")
-        if prog == "wl-paste":
-            return subprocess.CompletedProcess(cmd, 0, self.sel[primary], b"")
-        if prog == "wl-copy":
-            self.sel[primary] = input if input is not None else args[-1].encode()
-            return subprocess.CompletedProcess(cmd, 0, "", b"")
-        raise AssertionError(cmd)
+    def open(self, timeout=300):
+        self.log.append(("open",))
+        return FakeSession(self.log)
 
 
 @pytest.fixture
-def wayland(monkeypatch):
-    def make(**kw):
-        fake = FakeWayland(**kw)
-        monkeypatch.setattr(kb.subprocess, "run", fake.run)
-        monkeypatch.setattr(kb.time, "sleep", lambda s: None)
-        return fake
-    return make
+def keyboard():
+    k = Keyboard(layout="de", key_delay_ms=0, remote=FakeRemote())
+    k.gate = lambda: k.remote.log.append(("gate",))
+    return k
 
 
-def test_paste_uses_shift_insert_with_both_selections(wayland):
-    fake, seen = wayland(), []
-    k = Keyboard(layout="de")
-    k._keys = lambda events, delay_ms=12: seen.append((dict(fake.sel), " ".join(events)))
-    k.paste("😀")
-    # at the moment of the paste, clipboard and primary both hold the text
-    assert seen == [({(): "😀".encode(), ("--primary",): "😀".encode()}, kb.PASTE_KEYS)]
-    assert fake.sel == {(): b"mine", ("--primary",): b"selected"}      # both restored
+def test_write_one_session_gated_per_character(keyboard):
+    keyboard.write("ab")
+    assert keyboard.remote.log == [
+        ("gate",), ("open",), ("key", A, True), ("key", A, False),
+        ("gate",), ("key", 48, True), ("key", 48, False), ("close",)]
 
 
-def test_clipboard_restored_when_the_paste_fails(wayland):
-    fake = wayland(keys_fail=True)
-    with pytest.raises(subprocess.CalledProcessError):
-        Keyboard(layout="de").paste("😀")
-    assert fake.sel == {(): b"mine", ("--primary",): b"selected"}
+def test_write_turns_newlines_into_spaces(keyboard):
+    keyboard.write("a\nb")
+    keys = [e for e in keyboard.remote.log if e[0] == "key"]
+    assert keys[2:4] == [("key", SPACE, True), ("key", SPACE, False)]
 
 
-def test_paste_without_restoring(wayland):
-    fake = wayland()
-    Keyboard(layout="de", restore_clipboard=False).paste("😀")
-    assert fake.sel[()] == "😀".encode()
+def test_write_nothing_typeable_opens_no_session(keyboard):
+    keyboard.write("😀")
+    assert keyboard.remote.log == []
+
+
+def test_session_closed_when_typing_fails(keyboard):
+    def broken(code, pressed):
+        raise RuntimeError("portal gone")
+    keyboard.remote.open = lambda timeout=300: (
+        keyboard.remote.log.append(("open",)) or
+        type("S", (), {"key": staticmethod(broken),
+                       "close": lambda self: keyboard.remote.log.append(("close",))})())
+    with pytest.raises(RuntimeError):
+        keyboard.write("ab")
+    assert keyboard.remote.log[-1] == ("close",)
 
 
 def test_keymap_follows_gnome_layout(monkeypatch):
@@ -195,12 +204,3 @@ def test_keymap_follows_gnome_layout(monkeypatch):
     assert k.keymap().name == "us"
     monkeypatch.setattr(kb, "gnome_layout", lambda: ("de", "", ""))
     assert k.keymap().name == "de"
-
-
-def test_ydotool_socket_lookup(monkeypatch, tmp_path):
-    monkeypatch.delenv("YDOTOOL_SOCKET", raising=False)
-    monkeypatch.setattr(kb.paths, "RUNTIME_DIR", tmp_path)
-    (tmp_path / ".ydotool_socket").touch()
-    assert Keyboard._env()["YDOTOOL_SOCKET"] == str(tmp_path / ".ydotool_socket")
-    monkeypatch.setenv("YDOTOOL_SOCKET", "/custom")
-    assert Keyboard._env()["YDOTOOL_SOCKET"] == "/custom"
