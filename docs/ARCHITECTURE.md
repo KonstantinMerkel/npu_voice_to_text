@@ -123,7 +123,7 @@ Wayland doesn't let one app type into another. `ydotool` works around that one l
 **ydotool only sends key codes, not characters.** Its own `type` command assumes a US layout. On German that turns `y` into `z`, and umlauts don't work at all. So npu-voice-to-text computes the key codes itself:
 1. It reads the active input source from GNOME (`gsettings org.gnome.desktop.input-sources`), e.g. `de`.
 2. It compiles that layout with **libxkbcommon** (via `ctypes`), the same library GNOME uses to turn key codes into characters.
-3. It walks every key and every shift level and records which key code + Shift/AltGr produces each character. If several keys produce the same character, it prefers the main typing block over keypad or exotic keys (`KEY_EURO`, which apps often ignore), then fewer modifiers.
+3. It walks every key and every shift level and records which key code + Shift/AltGr produces each character. It only uses the main typing block (plus space, `<>|`, and the Japanese/Brazilian RO and YEN keys). Characters only found on the keypad or on exotic keys like `KEY_EURO` (€ on `us`) are pasted instead, because many apps ignore those keys. If several keys produce the same character, it prefers fewer modifiers.
 4. It also records **dead keys** (`´`, `` ` ``, `^`, …). A character with no key of its own is split with Unicode NFD (`é` → `e` + U+0301) and typed as dead key + base letter. A bare `^` is dead key + space.
 5. Characters the layout can't produce at all (emoji, `ñ` on German) are pasted through the clipboard (`wl-copy` + Ctrl+V), and the previous clipboard text is restored afterwards.
 

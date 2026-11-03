@@ -152,11 +152,16 @@ install -Dm644 "$SRC/systemd/npu-voice-to-text.service" "$UNITS/npu-voice-to-tex
 systemctl --user daemon-reload
 systemctl --user enable --quiet npu-voice-to-text
 systemctl --user restart npu-voice-to-text
+restarts=$(systemctl --user show -p NRestarts --value npu-voice-to-text)
 printf '    starting (the first start compiles the model for the NPU, up to a few minutes) '
 for (( i = 0; ; i++ )); do
     "$BIN/npu-voice-to-text" status -q && break
     systemctl --user is-failed -q npu-voice-to-text &&
         { echo; die "the service failed - see: journalctl --user -u npu-voice-to-text"; }
+    # Restart=on-failure every 5 s never hits systemd's start limit, so a crash loop
+    # never shows as "failed" - look at the restart counter instead
+    (( $(systemctl --user show -p NRestarts --value npu-voice-to-text) == restarts )) ||
+        { echo; die "the service keeps crashing - see: journalctl --user -u npu-voice-to-text"; }
     (( i < 900 )) || { echo; die "not ready after 15 min - see: journalctl --user -u npu-voice-to-text"; }
     (( i % 5 )) || printf .
     sleep 1

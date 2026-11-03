@@ -101,6 +101,10 @@ def run_client(cmd: str, quiet: bool = False) -> int:
 # =========================================================================== #
 # Linux input event codes (layout independent), see linux/input-event-codes.h
 KEY_LEFTSHIFT, KEY_RIGHTALT, KEY_SPACE = 42, 100, 57
+# keys we type with: the main block (codes 1-54) plus space, 102ND (<>|), RO and YEN.
+# Characters only found elsewhere - keypad, KEY_EURO on us, media keys - are pasted
+# instead, because many apps ignore those keys.
+TYPING_KEYS = frozenset(range(1, 55)) | {57, 86, 89, 124}
 PASTE_KEYS = {
     "ctrl-v": "29:1 47:1 47:0 29:0",
     "ctrl-shift-v": "29:1 42:1 47:1 47:0 42:0 29:0",   # terminals
@@ -190,10 +194,10 @@ class XkbKeymap:
                 mask = min(usable, key=lambda m: bin(m).count("1"))
                 mods = (KEY_RIGHTALT,) * bool(mask & altgr) + (KEY_LEFTSHIFT,) * bool(mask & shift)
                 code = kc - 8                           # xkb keycode = evdev keycode + 8
+                if code not in TYPING_KEYS:
+                    continue
                 stroke = (code, mods)
-                # prefer the main typing block (incl. KEY_102ND <>|) over keypad and
-                # exotic keys like KEY_EURO that apps may ignore, then fewest modifiers
-                cost = (not (1 <= code <= 54 or code in (57, 86)), len(mods), kc)
+                cost = (len(mods), kc)                  # fewest modifiers first
                 sym = syms[0]
                 if sym in DEAD_KEYS:
                     for key in DEAD_KEYS[sym]:
@@ -259,12 +263,18 @@ class Keyboard:
         self.mode, self.layout, self.key_delay = mode, layout, key_delay_ms
         self.paste_keys, self.restore_clipboard = paste_keys, restore_clipboard
         self._keymaps: dict[tuple, XkbKeymap] = {}
-        self.env = dict(os.environ)
-        if "YDOTOOL_SOCKET" not in self.env:      # ydotoold's default depends on how it runs
+
+    @staticmethod
+    def _env() -> dict:
+        """Environment for ydotool. Looked up on every call: ydotoold may be started
+        after the daemon, and its socket path depends on how it runs."""
+        env = dict(os.environ)
+        if "YDOTOOL_SOCKET" not in env:
             for cand in (RUNTIME_DIR / ".ydotool_socket", Path("/tmp/.ydotool_socket")):
                 if cand.exists():
-                    self.env["YDOTOOL_SOCKET"] = str(cand)
+                    env["YDOTOOL_SOCKET"] = str(cand)
                     break
+        return env
 
     def keymap(self) -> XkbKeymap:
         """Keymap of the layout GNOME uses right now (cached per layout)."""
@@ -287,29 +297,39 @@ class Keyboard:
         for kind, payload in self.keymap().plan(text):
             if kind == "paste":
                 print(f"not on layout, pasting: {payload!r}", flush=True)
-                self.paste(payload)
+                try:
+                    self.paste(payload)
+                except (OSError, subprocess.SubprocessError) as e:   # keep typing the rest
+                    print(f"  could not paste {payload!r}, skipped: {e!r}", file=sys.stderr,
+                          flush=True)
             else:
                 self._keys(payload, self.key_delay)
 
     def _keys(self, events: list[str], delay_ms: int = 12):
         for i in range(0, len(events), 400):        # keep each command line short
             subprocess.run(["ydotool", "key", "-d", str(delay_ms), *events[i:i + 400]],
-                           env=self.env, check=True, timeout=60)
+                           env=self._env(), check=True, timeout=60)
 
     def paste(self, text: str):
         old = None
         if self.restore_clipboard:
-            r = subprocess.run(["wl-paste", "--no-newline", "--type", "text/plain"],
-                               capture_output=True, timeout=2)
-            old = r.stdout if r.returncode == 0 else None
+            try:
+                r = subprocess.run(["wl-paste", "--no-newline", "--type", "text/plain"],
+                                   capture_output=True, timeout=2)
+                old = r.stdout if r.returncode == 0 else None
+            except subprocess.TimeoutExpired:       # clipboard owner not responding
+                print("  could not read the clipboard, it won't be restored", flush=True)
         subprocess.run(["wl-copy", "--type", "text/plain;charset=utf-8", "--", text],
                        check=True, timeout=5)
         time.sleep(0.15)                            # let the compositor see the new selection
         self._keys(PASTE_KEYS[self.paste_keys].split())
         if old is not None:
             time.sleep(0.5)                         # let the target app read the clipboard
-            subprocess.run(["wl-copy", "--type", "text/plain;charset=utf-8"], input=old,
-                           timeout=5, check=False)
+            try:
+                subprocess.run(["wl-copy", "--type", "text/plain;charset=utf-8"], input=old,
+                               timeout=5, check=False)
+            except subprocess.TimeoutExpired:
+                print("  could not restore the clipboard", flush=True)
 
 
 # =========================================================================== #
@@ -595,6 +615,10 @@ class Daemon:
                         conn.sendall(self.handle(cmd).encode() + b"\n")
                     except Exception as e:
                         print(f"request failed: {e!r}", file=sys.stderr, flush=True)
+                        try:
+                            conn.sendall(f"error: {e}\n".encode())
+                        except OSError:
+                            pass
         except KeyboardInterrupt:
             pass
         finally:
@@ -631,8 +655,7 @@ def read_options_file() -> list[str]:
         lines = OPTIONS_FILE.read_text().splitlines()
     except FileNotFoundError:
         return []
-    return [arg for line in lines if line.strip() and not line.lstrip().startswith("#")
-            for arg in shlex.split(line)]
+    return [arg for line in lines for arg in shlex.split(line, comments=True)]
 
 
 def main() -> int:

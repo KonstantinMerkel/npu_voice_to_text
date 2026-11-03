@@ -7,10 +7,9 @@
       e.g.  set F8 true   /   set F8 "~/.local/bin/npu-voice-to-text toggle"
   gnome-shortcut.py remove
 
-There is at most one npu-voice-to-text shortcut. An existing shortcut counts as ours
-if it is named or runs npu-voice-to-text (or npu-dictate, the project's former
-name), or is a do-nothing `true` on the same key (what the README used to tell
-people to create by hand) - it is updated in place instead of adding a duplicate. A
+There is at most one npu-voice-to-text shortcut: the one named npu-voice-to-text. It
+is updated in place instead of adding a duplicate. Shortcuts the user made that
+merely run npu-voice-to-text (e.g. `npu-voice-to-text cancel`) are not ours. A
 different shortcut on the same key is left alone and reported (exit code 2).
 """
 
@@ -19,7 +18,6 @@ import subprocess
 import sys
 
 NAME = "npu-voice-to-text"
-OUR_COMMANDS = ("npu-voice-to-text", "npu-dictate")   # incl. the former project name
 SCHEMA = "org.gnome.settings-daemon.plugins.media-keys"
 BASE = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/"
 
@@ -54,8 +52,7 @@ def main() -> int:
     ours, conflicts = [], []
     for p in paths:
         name, cmd, binding = (gs_get(entry(p), k) for k in ("name", "command", "binding"))
-        if (name in OUR_COMMANDS or any(c in cmd for c in OUR_COMMANDS)
-                or (cmd.strip() == "true" and binding == accel)):
+        if name == NAME:
             ours.append(p)
         elif accel and binding == accel:
             conflicts.append(f"'{name}' ({cmd})")
