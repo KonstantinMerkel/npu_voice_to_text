@@ -5,7 +5,7 @@ Hold-to-talk dictation for GNOME on Wayland. The speech recognition runs locally
 Hold a key (F8 by default), speak German or English, release. About two seconds later the text is typed into whatever window has focus.
 
 - **Offline.** Whisper large-v3-turbo runs on the NPU via [OpenVINO GenAI](https://github.com/openvinotoolkit/openvino.genai). Nothing leaves the machine, and the CPU and GPU stay free.
-- **Works on Wayland.** Text is typed through [ydotool](https://github.com/ReimuNotMoe/ydotool) (kernel uinput), so Wayland doesn't block it, and your clipboard isn't touched.
+- **Works on Wayland.** Text is typed through [ydotool](https://github.com/ReimuNotMoe/ydotool) (kernel uinput), so Wayland doesn't block it. Your clipboard is only used for the rare character your layout has no key for (emoji, for example), and restored right after.
 - **Correct characters on any layout.** The keystrokes are computed from your active GNOME layout with libxkbcommon. On a German layout, `y`/`z`, `ä ö ü ß`, `€`, `@`, `„“` and dead-key accents (`é`) come out right.
 - **German and English, detected per recording.** Other languages fall back to English. Single words, which Whisper can't identify, keep the language of your previous dictation.
 
@@ -99,10 +99,9 @@ Options go into `~/.config/npu-voice-to-text/options`, one per line (`#` comment
 | `--language` | – | Force one language and skip detection. Whisper then **translates** speech in other languages into it. |
 | `--model` | `OpenVINO/whisper-large-v3-turbo-int8-ov` | Any `OpenVINO/whisper-*-ov` model. Fetch it first with `npu-voice-to-text download --model …`. `whisper-small-int8-ov` is ~5× faster but less accurate. |
 | `--device` | `NPU` | `GPU` or `CPU` also work |
-| `--output` | `type` | `paste` = clipboard + Ctrl+V instead of typing |
 | `--layout` | active GNOME layout | e.g. `de+nodeadkeys`, for non-GNOME desktops |
 | `--key-delay` | `4` | ms between key events. Raise it if an app drops characters. |
-| `--paste-keys` | `ctrl-v` | `ctrl-shift-v` for terminals. Used for `--output paste` and for characters your layout can't type (emoji). |
+| `--no-restore-clipboard` | | Don't restore the clipboard after pasting a character your layout can't type |
 | `--no-trailing-space` | | Don't add a space after each dictation |
 | `--input-device` | set by `install.sh` | Preferred microphone: a PipeWire source name from `pactl list sources short`. Used while connected, otherwise the system default. |
 | `--sounds` | | Start/stop sounds. The first 0.4 s of each recording (the start sound) is dropped, so start speaking after it |

@@ -177,3 +177,83 @@ def test_socket_server(make, tmp_path):
     assert request("press", path=sock) == "recording"
     assert request("nope", path=sock).startswith("error")
     assert request("status", path=tmp_path / "missing.sock") is None
+
+
+def test_missing_pw_play_does_not_lose_the_dictation(make, monkeypatch):
+    d, _, _, kb = make(sounds=True)
+    monkeypatch.setattr("npu_voice_to_text.daemon.os.path.exists", lambda p: True)
+
+    def no_pw_play(*a, **kw):
+        raise FileNotFoundError("pw-play")
+    monkeypatch.setattr("npu_voice_to_text.daemon.subprocess.Popen", no_pw_play)
+    assert d.press() == "recording"
+    assert d.release() == "transcribing"
+    wait_until(lambda: d.status() == "idle")
+    assert kb.typed == "hallo "
+
+
+def test_time_limit_after_the_user_stopped(make):
+    """The limit fires just after the user's own stop: nothing changes, and the next
+    toggle starts a recording instead of being swallowed."""
+    d, _, _, _ = make(texts=["eins", "zwei"])
+    d.toggle(), d.toggle()
+    d._limit_reached()
+    assert d.status() != "recording"
+    assert d.toggle() == "recording"
+
+
+def test_stop_racing_the_time_limit(make):
+    """The limit fires between the user's toggle check and its release: the release
+    reports it, and the next toggle starts a recording."""
+    d, _, _, _ = make(texts=["eins", "zwei"])
+    d.toggle()
+    d._limit_reached()
+    assert d.release() == "not recording (stopped by the time limit)"
+    assert d.toggle() == "recording"
+
+
+def test_silent_client_does_not_block(make, tmp_path, monkeypatch):
+    import socket as socketlib
+    monkeypatch.setattr("npu_voice_to_text.daemon.CLIENT_TIMEOUT", 0.2)
+    d, _, _, _ = make()
+    sock = tmp_path / "d.sock"
+    threading.Thread(target=d.serve, args=(sock,), daemon=True).start()
+    wait_until(lambda: request("status", path=sock) == "idle")
+    with socketlib.socket(socketlib.AF_UNIX) as silent:
+        silent.connect(str(sock))                       # ... and never sends anything
+        t0 = time.monotonic()
+        assert request("press", path=sock) == "recording"
+        assert time.monotonic() - t0 < 2
+
+
+def test_daemon_running_and_empty_reply(tmp_path):
+    import socket as socketlib
+    from npu_voice_to_text.client import daemon_running
+    sock = tmp_path / "busy.sock"
+    assert not daemon_running(sock)
+    srv = socketlib.socket(socketlib.AF_UNIX)
+    srv.bind(str(sock)), srv.listen()
+    assert daemon_running(sock)                          # listening, even if it never answers
+
+    def hang_up():
+        while True:                                      # every connection, also the probe's
+            conn, _ = srv.accept()
+            conn.recv(256)
+            conn.close()                                 # dies without answering
+    threading.Thread(target=hang_up, daemon=True).start()
+    t0 = time.monotonic()
+    assert request("status", path=sock) is None
+    assert time.monotonic() - t0 < 1                     # the hang-up, not the timeout
+    srv.close()
+
+
+def test_probe_is_not_a_command(make, tmp_path, capsys):
+    from npu_voice_to_text.client import daemon_running
+    d, _, _, _ = make()
+    sock = tmp_path / "d.sock"
+    threading.Thread(target=d.serve, args=(sock,), daemon=True).start()
+    wait_until(lambda: request("status", path=sock) == "idle")
+    assert daemon_running(sock)
+    assert request("status", path=sock) == "idle"
+    out = capsys.readouterr()
+    assert "command:  " not in out.out and "request failed" not in out.err

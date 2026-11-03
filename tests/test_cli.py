@@ -22,7 +22,7 @@ def test_options_file(tmp_path, monkeypatch):
 def test_missing_options_file(tmp_path, monkeypatch):
     monkeypatch.setattr(paths, "OPTIONS_FILE", tmp_path / "none")
     args = cli.parse_args(["serve"])
-    assert args.device == "NPU" and args.output == "type" and args.trailing_space
+    assert args.device == "NPU" and args.restore_clipboard and args.trailing_space
 
 
 def test_options_file_is_only_for_serve(tmp_path, monkeypatch):
@@ -48,3 +48,24 @@ def test_client_without_daemon(tmp_path, monkeypatch, capsys):
     assert "not running" in capsys.readouterr().err
     assert cli.main(["status", "-q"]) == 1
     assert capsys.readouterr().err == ""
+
+
+def test_options_file_with_unclosed_quote(tmp_path, monkeypatch):
+    import pytest
+    opts = tmp_path / "options"
+    opts.write_text("--sounds\n--input-device 'my mic\n")
+    monkeypatch.setattr(paths, "OPTIONS_FILE", opts)
+    with pytest.raises(SystemExit) as e:
+        cli.parse_args(["serve"])
+    assert "line 2" in str(e.value) and str(opts) in str(e.value)
+
+
+def test_unknown_option_in_file_names_the_file(tmp_path, monkeypatch, capsys):
+    import pytest
+    opts = tmp_path / "options"
+    opts.write_text("--output paste\n")                  # removed option
+    monkeypatch.setattr(paths, "OPTIONS_FILE", opts)
+    with pytest.raises(SystemExit):
+        cli.parse_args(["serve"])
+    err = capsys.readouterr().err
+    assert "--output" in err and str(opts) in err

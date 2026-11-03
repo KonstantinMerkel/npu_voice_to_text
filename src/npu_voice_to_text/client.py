@@ -17,9 +17,20 @@ def request(cmd: str, timeout: float = 5, path: Path | None = None) -> str | Non
             s.settimeout(timeout)
             s.connect(str(path or paths.SOCKET_PATH))
             s.sendall(cmd.encode() + b"\n")
-            return s.recv(4096).decode().strip()
+            # empty: the daemon closed the connection without answering (it died)
+            return s.recv(4096).decode().strip() or None
     except OSError:                     # not running, stale socket, timeout, …
         return None
+
+
+def daemon_running(path: Path | None = None) -> bool:
+    """Whether a daemon listens on the socket - even one too busy to answer right now."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.connect(str(path or paths.SOCKET_PATH))
+            return True
+    except OSError:                     # no socket, or a stale one nobody listens on
+        return False
 
 
 def run_client(cmd: str, quiet: bool = False) -> int:

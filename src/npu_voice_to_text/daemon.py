@@ -16,7 +16,7 @@ from pathlib import Path
 from . import paths
 from .audio import (MAX_SECONDS, MIN_SPEECH_SECONDS, NOISE_FLOOR_MIN, SAMPLE_RATE, Recorder,
                     silent_start, speech_stats)
-from .client import request
+from .client import daemon_running
 from .keyboard import Keyboard
 from .transcriber import Transcriber, lang_code
 
@@ -24,6 +24,7 @@ SOUND_START = "/usr/share/sounds/freedesktop/stereo/device-added.oga"
 SOUND_STOP = "/usr/share/sounds/freedesktop/stereo/device-removed.oga"
 SOUND_START_SKIP = 0.4     # seconds of audio dropped after the start sound (0.22 s + latency)
 SILENT_START_WARNING = 0.3  # seconds of digital silence at the start worth a warning
+CLIENT_TIMEOUT = 2.0        # seconds a client may take to send its command
 
 
 class Daemon:
@@ -65,8 +66,7 @@ class Daemon:
             args.model, args.device, args.detect_model, args.detect_device, languages,
             lang_code(args.fallback_language), args.language and lang_code(args.language))
         recorder = Recorder(args.input_device)
-        keyboard = Keyboard(args.output, args.layout, args.key_delay, args.paste_keys,
-                            args.restore_clipboard)
+        keyboard = Keyboard(args.layout, args.key_delay, args.restore_clipboard)
         daemon = cls(transcriber, recorder, keyboard, sounds=args.sounds,
                      trailing_space=args.trailing_space)
         lang = (f"forced {args.language}" if args.language else
@@ -98,14 +98,21 @@ class Daemon:
     def release(self) -> str:
         with self.lock:
             if not self.recording:
-                return "not recording"
-            audio = self.recorder.stop()
-            self.recording = False
-            self.pending += 1
-            self.mic_free.notify_all()
+                # a stop that arrives after the time limit already stopped the
+                # recording has done its job: the next toggle starts a new one
+                stopped_by_limit, self.limit_stopped = self.limit_stopped, False
+                return ("not recording (stopped by the time limit)" if stopped_by_limit
+                        else "not recording")
+            self._stop_and_queue()
         self._sound(SOUND_STOP)
-        self.jobs.put(audio)
         return "transcribing"
+
+    def _stop_and_queue(self):
+        """Stop the recording and queue it for transcription. Called with the lock held."""
+        self.jobs.put(self.recorder.stop())
+        self.recording = False
+        self.pending += 1
+        self.mic_free.notify_all()
 
     def toggle(self) -> str:
         if self.recording:
@@ -118,10 +125,15 @@ class Daemon:
         return self.press()
 
     def _limit_reached(self):
-        print(f"  recording stopped after the {MAX_SECONDS} s limit", flush=True)
+        # checked and stopped under one lock: a release + press in between must not
+        # get its new recording stopped, nor leave limit_stopped set
         with self.lock:
-            self.limit_stopped = self.recording
-        self.release()
+            if not self.recording:
+                return
+            print(f"  recording stopped after the {MAX_SECONDS} s limit", flush=True)
+            self._stop_and_queue()
+            self.limit_stopped = True
+        self._sound(SOUND_STOP)
 
     def cancel(self) -> str:
         with self.lock:
@@ -180,8 +192,11 @@ class Daemon:
 
     def _sound(self, path: str):
         if self.sounds and os.path.exists(path):
-            subprocess.Popen(["pw-play", path], stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL)
+            try:
+                subprocess.Popen(["pw-play", path], stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+            except OSError as e:                    # pw-play missing: dictate without sound
+                print(f"  could not play a sound: {e!r}", flush=True)
 
     # ---- socket server ---------------------------------------------------- #
     def serve(self, path: Path | None = None):
@@ -199,7 +214,12 @@ class Daemon:
                 conn, _ = srv.accept()
                 with conn:
                     try:
+                        # commands are handled one at a time: a client that connects
+                        # and sends nothing must not block the dictation key
+                        conn.settimeout(CLIENT_TIMEOUT)
                         cmd = conn.recv(256).decode().strip()
+                        if not cmd:                 # a probe (daemon_running) or hang-up
+                            continue
                         conn.sendall(self.handle(cmd).encode() + b"\n")
                     except Exception as e:
                         print(f"request failed: {e!r}", file=sys.stderr, flush=True)
@@ -216,7 +236,7 @@ class Daemon:
 
 def run(args) -> int:
     """`npu-voice-to-text serve`"""
-    if request("status", timeout=1) is not None:
+    if daemon_running():           # also when it is too busy to answer right now
         sys.exit("npu-voice-to-text is already running")
     paths.SOCKET_PATH.unlink(missing_ok=True)       # stale socket from a crash
     # systemd stops us with SIGTERM: turn it into SystemExit so serve()'s

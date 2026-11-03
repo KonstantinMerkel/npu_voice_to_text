@@ -5,7 +5,8 @@
 Wayland lets no app type into another, so the text goes through ydotool (kernel
 uinput). ydotool only sends key codes, so the codes for each character are worked
 out from the active xkb layout with libxkbcommon (XkbKeymap). Characters the layout
-can't produce are pasted through the clipboard.
+can't produce (emoji; on a US layout also umlauts, € and typographic quotes) are
+pasted with Shift+Insert, and the clipboard is restored afterwards.
 """
 
 import ast
@@ -29,11 +30,13 @@ XKB_VIRTUAL_KEYS = {84, 195}
 # Characters only found elsewhere - keypad, KEY_EURO on us, media keys - are pasted
 # instead, because many apps ignore those keys.
 TYPING_KEYS = frozenset(range(1, 55)) | {57, 86, 89, 124}
-PASTE_KEYS = {
-    "ctrl-v": "29:1 47:1 47:0 29:0",
-    "ctrl-shift-v": "29:1 42:1 47:1 47:0 42:0 29:0",   # terminals
-    "shift-insert": "42:1 110:1 110:0 42:0",
-}
+# Pasting the characters a layout can't type: Shift+Insert, with the text in both the
+# clipboard and the primary selection. Apps (GTK, Qt, browsers, Electron, LibreOffice)
+# paste the clipboard on Shift+Insert, terminals (VTE, kitty, foot, Alacritty, xterm)
+# paste the primary selection - so one shortcut works everywhere, unlike Ctrl+V
+# (terminals need Ctrl+Shift+V there).
+PASTE_KEYS = "42:1 110:1 110:0 42:0"
+SELECTIONS = ((), ("--primary",))       # wl-copy / wl-paste flags: clipboard, primary
 CLIPBOARD_FILE_TYPES = ("x-special/gnome-copied-files",)
 CLIPBOARD_TEXT_TYPES = ("text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "STRING",
                         "TEXT")
@@ -194,19 +197,16 @@ class XkbKeymap:
 
 
 class Keyboard:
-    """Writes text into the focused window through ydotool (kernel uinput).
-
-    mode "type":  keystrokes computed for the active layout; characters the layout
-                  can't produce are pasted via the clipboard.
-    mode "paste": everything via clipboard + paste shortcut.
+    """Writes text into the focused window through ydotool (kernel uinput): keystrokes
+    computed for the active layout; characters the layout can't produce are pasted.
     """
 
-    def __init__(self, mode: str = "type", layout: str | None = None, key_delay_ms: int = 4,
-                 paste_keys: str = "ctrl-v", restore_clipboard: bool = True):
+    def __init__(self, layout: str | None = None, key_delay_ms: int = 4,
+                 restore_clipboard: bool = True):
         """`gate` is called before every ydotool call and may block to pause typing.
         It does nothing until the daemon sets it."""
-        self.mode, self.layout, self.key_delay = mode, layout, key_delay_ms
-        self.paste_keys, self.restore_clipboard = paste_keys, restore_clipboard
+        self.layout, self.key_delay = layout, key_delay_ms
+        self.restore_clipboard = restore_clipboard
         self.gate = lambda: None
         self._keymaps: dict[tuple, XkbKeymap] = {}
 
@@ -238,8 +238,6 @@ class Keyboard:
     def write(self, text: str):
         # newlines/tabs become spaces: Enter would send chat messages
         text = text.translate({ord("\n"): " ", ord("\r"): " ", ord("\t"): " "})
-        if self.mode == "paste":
-            return self.paste(text)
         for kind, payload in self.keymap().plan(text):
             if kind == "paste":
                 print(f"not on layout, pasting: {payload!r}", flush=True)
@@ -264,42 +262,53 @@ class Keyboard:
                        env=self._env(), check=True, timeout=60)
 
     def paste(self, text: str):
+        """Shift+Insert with `text` in the clipboard and the primary selection. Both are
+        restored afterwards, also when a step fails."""
         # gated once, before the clipboard is touched: waiting between the copy and
-        # Ctrl+V would leave the fragment in the clipboard for a whole recording
+        # the paste would leave the fragment in the clipboard for a whole recording
         self.gate()
-        old = self._save_clipboard() if self.restore_clipboard else None
-        subprocess.run(["wl-copy", "--type", "text/plain;charset=utf-8", "--", text],
-                       check=True, timeout=5)
-        time.sleep(0.15)                            # let the compositor see the new selection
-        self._keys(PASTE_KEYS[self.paste_keys].split())
-        if old is not None:
-            time.sleep(0.5)                         # let the target app read the clipboard
-            mime, data = old
-            try:
-                subprocess.run(["wl-copy", "--type", mime], input=data, timeout=5, check=False)
-            except subprocess.TimeoutExpired:
-                print("  could not restore the clipboard", flush=True)
+        saved = ([(sel, self._save_selection(sel)) for sel in SELECTIONS]
+                 if self.restore_clipboard else [])
+        try:
+            for sel in SELECTIONS:
+                subprocess.run(["wl-copy", *sel, "--type", "text/plain;charset=utf-8", "--",
+                                text], check=True, timeout=5)
+            time.sleep(0.15)                        # let the compositor see the new selection
+            self._keys(PASTE_KEYS.split())
+            time.sleep(0.5)                         # let the target app read it
+        finally:
+            for sel, old in saved:
+                if old is None:
+                    continue
+                mime, data = old
+                try:
+                    subprocess.run(["wl-copy", *sel, "--type", mime], input=data, timeout=5,
+                                   check=False)
+                except (OSError, subprocess.TimeoutExpired):
+                    print(f"  could not restore the {'primary selection' if sel else 'clipboard'}",
+                          flush=True)
 
     @staticmethod
-    def _save_clipboard() -> tuple[str, bytes] | None:
-        """(mime type, data) of the clipboard, or None if it is empty or unreadable.
+    def _save_selection(sel: tuple = ()) -> tuple[str, bytes] | None:
+        """(mime type, data) of the clipboard (or with ("--primary",) the primary
+        selection), or None if it is empty or unreadable.
 
         wl-copy can offer only one type, so one is chosen: copied files (GNOME's file
         list type - file managers also offer them as text), else text, else the first
         real mime type (an image, ...).
         """
         try:
-            r = subprocess.run(["wl-paste", "--list-types"], capture_output=True, text=True,
-                               timeout=2)
+            r = subprocess.run(["wl-paste", *sel, "--list-types"], capture_output=True,
+                               text=True, timeout=2)
             types = r.stdout.splitlines() if r.returncode == 0 else []
             mime = (next((t for t in CLIPBOARD_FILE_TYPES if t in types), None)
                     or next((t for t in CLIPBOARD_TEXT_TYPES if t in types), None)
                     or next((t for t in types if "/" in t), None))
             if mime is None:
                 return None
-            r = subprocess.run(["wl-paste", "--no-newline", "--type", mime], capture_output=True,
-                               timeout=2)
+            r = subprocess.run(["wl-paste", *sel, "--no-newline", "--type", mime],
+                               capture_output=True, timeout=2)
             return (mime, r.stdout) if r.returncode == 0 else None
-        except subprocess.TimeoutExpired:           # clipboard owner not responding
+        except (OSError, subprocess.TimeoutExpired):    # owner not responding / no wl-paste
             print("  could not read the clipboard, it won't be restored", flush=True)
             return None

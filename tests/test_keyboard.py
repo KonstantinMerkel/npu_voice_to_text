@@ -1,6 +1,7 @@
 """Text -> keystrokes. Uses the system's libxkbcommon and xkb data, but no ydotool."""
 
 import ctypes.util
+import subprocess
 
 import pytest
 
@@ -129,10 +130,63 @@ def test_write_pastes_what_the_layout_lacks():
     assert ("paste", "😀") in k.calls
 
 
-def test_paste_mode_pastes_everything():
-    k = Recording(mode="paste")
-    k.write("hallo\twelt")
-    assert k.calls == [("paste", "hallo welt")]
+class FakeWayland:
+    """wl-copy / wl-paste / ydotool stand-in: two selections and a log of key presses."""
+
+    def __init__(self, clipboard=b"mine", primary=b"selected", keys_fail=False):
+        self.sel = {(): clipboard, ("--primary",): primary}
+        self.keys, self.keys_fail = [], keys_fail
+
+    def run(self, cmd, input=None, **kw):
+        prog, *args = cmd
+        primary = ("--primary",) if "--primary" in args else ()
+        if prog == "ydotool":
+            if self.keys_fail:
+                raise subprocess.CalledProcessError(1, cmd)
+            self.keys.append(" ".join(args[3:]))
+            return subprocess.CompletedProcess(cmd, 0, "", b"")
+        if prog == "wl-paste" and "--list-types" in args:
+            out = "text/plain;charset=utf-8\n" if self.sel[primary] is not None else ""
+            return subprocess.CompletedProcess(cmd, 0 if out else 1, out, "")
+        if prog == "wl-paste":
+            return subprocess.CompletedProcess(cmd, 0, self.sel[primary], b"")
+        if prog == "wl-copy":
+            self.sel[primary] = input if input is not None else args[-1].encode()
+            return subprocess.CompletedProcess(cmd, 0, "", b"")
+        raise AssertionError(cmd)
+
+
+@pytest.fixture
+def wayland(monkeypatch):
+    def make(**kw):
+        fake = FakeWayland(**kw)
+        monkeypatch.setattr(kb.subprocess, "run", fake.run)
+        monkeypatch.setattr(kb.time, "sleep", lambda s: None)
+        return fake
+    return make
+
+
+def test_paste_uses_shift_insert_with_both_selections(wayland):
+    fake, seen = wayland(), []
+    k = Keyboard(layout="de")
+    k._keys = lambda events, delay_ms=12: seen.append((dict(fake.sel), " ".join(events)))
+    k.paste("😀")
+    # at the moment of the paste, clipboard and primary both hold the text
+    assert seen == [({(): "😀".encode(), ("--primary",): "😀".encode()}, kb.PASTE_KEYS)]
+    assert fake.sel == {(): b"mine", ("--primary",): b"selected"}      # both restored
+
+
+def test_clipboard_restored_when_the_paste_fails(wayland):
+    fake = wayland(keys_fail=True)
+    with pytest.raises(subprocess.CalledProcessError):
+        Keyboard(layout="de").paste("😀")
+    assert fake.sel == {(): b"mine", ("--primary",): b"selected"}
+
+
+def test_paste_without_restoring(wayland):
+    fake = wayland()
+    Keyboard(layout="de", restore_clipboard=False).paste("😀")
+    assert fake.sel[()] == "😀".encode()
 
 
 def test_keymap_follows_gnome_layout(monkeypatch):

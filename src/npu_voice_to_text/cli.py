@@ -20,19 +20,28 @@ from pathlib import Path
 
 from . import paths
 from .client import run_client
-from .keyboard import PASTE_KEYS
 from .models import DEFAULT_MODEL, DETECT_MODEL
 
 CLIENT_COMMANDS = ("press", "release", "toggle", "cancel", "status")
 
 
 def read_options_file(path: Path | None = None) -> list[str]:
-    """`serve` options from ~/.config/npu-voice-to-text/options: one per line, # comments."""
+    """`serve` options from ~/.config/npu-voice-to-text/options: one per line, # comments.
+    Exits with a message naming the file (and line) if it can't be used."""
+    path = path or paths.OPTIONS_FILE
     try:
-        lines = (path or paths.OPTIONS_FILE).read_text().splitlines()
+        lines = path.read_text().splitlines()
     except FileNotFoundError:
         return []
-    return [arg for line in lines for arg in shlex.split(line, comments=True)]
+    except (OSError, UnicodeDecodeError) as e:
+        sys.exit(f"cannot read {path}: {e}")
+    args = []
+    for n, line in enumerate(lines, 1):
+        try:
+            args += shlex.split(line, comments=True)
+        except ValueError as e:                     # e.g. an unclosed quote
+            sys.exit(f"{path}, line {n}: {e}: {line}")
+    return args
 
 
 def parser() -> argparse.ArgumentParser:
@@ -57,18 +66,14 @@ def parser() -> argparse.ArgumentParser:
                    help="force ONE language and skip detection. Whisper then translates "
                         "speech in other languages into it")
     g = sv.add_argument_group("output")
-    g.add_argument("--output", choices=("type", "paste"), default="type",
-                   help="type: keystrokes for the active layout (default); paste: clipboard")
     g.add_argument("--layout", default=None,
                    help="xkb layout[+variant] to type for, e.g. de+nodeadkeys "
                         "(default: the active GNOME input source)")
     g.add_argument("--key-delay", type=int, default=4,
                    help="ms between key events (default: %(default)s)")
-    g.add_argument("--paste-keys", choices=PASTE_KEYS, default="ctrl-v",
-                   help="paste shortcut for --output paste and for characters the layout "
-                        "can't type (default: %(default)s)")
     g.add_argument("--no-restore-clipboard", dest="restore_clipboard", action="store_false",
-                   help="don't restore the clipboard after pasting")
+                   help="don't restore the clipboard after pasting a character the layout "
+                        "can't type (emoji, ...)")
     g.add_argument("--no-trailing-space", dest="trailing_space", action="store_false",
                    help="don't add a space after each dictation")
     g = sv.add_argument_group("misc")
@@ -87,9 +92,15 @@ def parser() -> argparse.ArgumentParser:
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    if argv[:1] == ["serve"]:                       # options file first, command line wins
-        argv = ["serve", *read_options_file(), *argv[1:]]
-    return parser().parse_args(argv)
+    if argv[:1] != ["serve"]:
+        return parser().parse_args(argv)
+    from_file = read_options_file()
+    try:                                            # options file first, command line wins
+        return parser().parse_args(["serve", *from_file, *argv[1:]])
+    except SystemExit as e:
+        if e.code and from_file:                    # argparse printed what is wrong
+            print(f"(options are also read from {paths.OPTIONS_FILE})", file=sys.stderr)
+        raise
 
 
 def main(argv: list[str] | None = None) -> int:
