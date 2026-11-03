@@ -18,9 +18,11 @@ See docs/ARCHITECTURE.md for how the pieces fit together.
 
 import argparse
 import ast
+import collections
 import ctypes
 import json
 import os
+import queue
 import shlex
 import signal
 import socket
@@ -51,22 +53,27 @@ DETECT_MIN_SPEECH = 1.0    # language detection is unreliable below ~1 s of spee
                            # (single words come out as "en"), so short clips reuse
                            # the last detected language instead
 
-# Phrases Whisper tends to "hear" in silence or noise.
+# Phrases Whisper "hears" in silence or noise (subtitle credits from its training
+# data). Always dropped.
 HALLUCINATIONS = {
     "untertitel der amara.org-community",
     "untertitel im auftrag des zdf, 2017",
     "untertitel im auftrag des zdf für funk, 2017",
-    "vielen dank.",
     "vielen dank fürs zuschauen.",
     "swr 2020",
     "swr 2021",
-    "thank you.",
     "thanks for watching!",
-    "you",
 }
+# Phrases Whisper also hallucinates, but that people really say. Dropped only when
+# the clip had barely any speech (a key click or a breath that just passed the
+# speech detector), so a dictated "Vielen Dank." is typed.
+SHORT_HALLUCINATIONS = {"vielen dank.", "thank you.", "you"}
+SHORT_HALLUCINATION_SPEECH = 0.3   # seconds
 
 SOUND_START = "/usr/share/sounds/freedesktop/stereo/device-added.oga"
 SOUND_STOP = "/usr/share/sounds/freedesktop/stereo/device-removed.oga"
+SOUND_START_SKIP = 0.4     # seconds of audio dropped after the start sound (0.22 s + latency)
+NOISE_FLOOR_MIN = 1e-5     # quieter "noise floors" are digital silence, not a measurement
 
 
 # =========================================================================== #
@@ -102,6 +109,10 @@ def run_client(cmd: str, quiet: bool = False) -> int:
 # =========================================================================== #
 # Linux input event codes (layout independent), see linux/input-event-codes.h
 KEY_LEFTSHIFT, KEY_RIGHTALT, KEY_SPACE = 42, 100, 57
+ISO_LEVEL3_SHIFT = 0xFE03  # keysym of the AltGr function
+# xkb's virtual <LVL3> and <MDSW> keys: they exist in every keymap, but no keyboard
+# has them, and ydotoold's virtual keyboard can't send them either
+XKB_VIRTUAL_KEYS = {84, 195}
 # keys we type with: the main block (codes 1-54) plus space, 102ND (<>|), RO and YEN.
 # Characters only found elsewhere - keypad, KEY_EURO on us, media keys - are pasted
 # instead, because many apps ignore those keys.
@@ -111,6 +122,9 @@ PASTE_KEYS = {
     "ctrl-shift-v": "29:1 42:1 47:1 47:0 42:0 29:0",   # terminals
     "shift-insert": "42:1 110:1 110:0 42:0",
 }
+CLIPBOARD_FILE_TYPES = ("x-special/gnome-copied-files",)
+CLIPBOARD_TEXT_TYPES = ("text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "STRING",
+                        "TEXT")
 # dead keysym -> (combining mark it adds, character it types when followed by space)
 DEAD_KEYS = {
     0xFE50: ("̀", "`"), 0xFE51: ("́", "´"), 0xFE52: ("̂", "^"),
@@ -179,10 +193,22 @@ class XkbKeymap:
         altgr = 1 << x.xkb_keymap_mod_get_index(km, b"Mod5")      # ISO_Level3_Shift
         best: dict[str, tuple] = {}     # char -> (cost, stroke)
         dead: dict[str, tuple] = {}     # combining mark / spacing char -> (cost, stroke)
+        keycodes = [kc for kc in range(x.xkb_keymap_min_keycode(km),
+                                       x.xkb_keymap_max_keycode(km) + 1)
+                    if x.xkb_keymap_num_layouts_for_key(km, kc) >= 1]
 
-        for kc in range(x.xkb_keymap_min_keycode(km), x.xkb_keymap_max_keycode(km) + 1):
-            if x.xkb_keymap_num_layouts_for_key(km, kc) < 1:
-                continue
+        # The key that acts as AltGr: Right Alt on most layouts, but options like
+        # compose:ralt or lv3:caps_switch move it. None: AltGr characters get pasted.
+        level3 = []
+        for kc in keycodes:
+            syms = ctypes.POINTER(U32)()
+            if (kc - 8 not in XKB_VIRTUAL_KEYS
+                    and x.xkb_keymap_key_get_syms_by_level(km, kc, 0, 0, ctypes.byref(syms)) == 1
+                    and syms[0] == ISO_LEVEL3_SHIFT):
+                level3.append(kc - 8)
+        self.altgr_key = KEY_RIGHTALT if KEY_RIGHTALT in level3 else next(iter(level3), None)
+
+        for kc in keycodes:
             for lvl in range(x.xkb_keymap_num_levels_for_key(km, kc, 0)):
                 syms = ctypes.POINTER(U32)()
                 if x.xkb_keymap_key_get_syms_by_level(km, kc, 0, lvl, ctypes.byref(syms)) != 1:
@@ -193,7 +219,10 @@ class XkbKeymap:
                 if not usable:
                     continue
                 mask = min(usable, key=lambda m: bin(m).count("1"))
-                mods = (KEY_RIGHTALT,) * bool(mask & altgr) + (KEY_LEFTSHIFT,) * bool(mask & shift)
+                if mask & altgr and self.altgr_key is None:
+                    continue
+                mods = ((self.altgr_key,) * bool(mask & altgr)
+                        + (KEY_LEFTSHIFT,) * bool(mask & shift))
                 code = kc - 8                           # xkb keycode = evdev keycode + 8
                 if code not in TYPING_KEYS:
                     continue
@@ -230,7 +259,8 @@ class XkbKeymap:
         return None
 
     def plan(self, text: str) -> list[tuple[str, object]]:
-        """Split text into [("keys", [ydotool events]) | ("paste", str)] segments."""
+        """Split text into ("keys", [[ydotool events of one character], ...]) and
+        ("paste", str) segments."""
         segs: list = []
         for ch in text:
             strokes = self.strokes_for(ch)
@@ -245,9 +275,9 @@ class XkbKeymap:
                 ev += [f"{m}:1" for m in mods] + [f"{code}:1", f"{code}:0"]
                 ev += [f"{m}:0" for m in reversed(mods)]
             if segs and segs[-1][0] == "keys":
-                segs[-1][1].extend(ev)
+                segs[-1][1].append(ev)
             else:
-                segs.append(("keys", ev))
+                segs.append(("keys", [ev]))
         return segs
 
 
@@ -260,9 +290,11 @@ class Keyboard:
     """
 
     def __init__(self, mode: str = "type", layout: str | None = None, key_delay_ms: int = 4,
-                 paste_keys: str = "ctrl-v", restore_clipboard: bool = True):
+                 paste_keys: str = "ctrl-v", restore_clipboard: bool = True, gate=None):
+        """gate: called before every ydotool call; may block to pause typing."""
         self.mode, self.layout, self.key_delay = mode, layout, key_delay_ms
         self.paste_keys, self.restore_clipboard = paste_keys, restore_clipboard
+        self.gate = gate or (lambda: None)
         self._keymaps: dict[tuple, XkbKeymap] = {}
 
     @staticmethod
@@ -304,33 +336,60 @@ class Keyboard:
                     print(f"  could not paste {payload!r}, skipped: {e!r}", file=sys.stderr,
                           flush=True)
             else:
-                self._keys(payload, self.key_delay)
+                self._type(payload)
+
+    def _type(self, chars: list[list[str]]):
+        """One ydotool call per character (~0.4 ms each), with the gate before each:
+        typing can pause between any two characters, and never with Shift or AltGr
+        held down."""
+        for events in chars:
+            self.gate()
+            self._keys(events, self.key_delay)
 
     def _keys(self, events: list[str], delay_ms: int = 12):
-        for i in range(0, len(events), 400):        # keep each command line short
-            subprocess.run(["ydotool", "key", "-d", str(delay_ms), *events[i:i + 400]],
-                           env=self._env(), check=True, timeout=60)
+        subprocess.run(["ydotool", "key", "-d", str(delay_ms), *events],
+                       env=self._env(), check=True, timeout=60)
 
     def paste(self, text: str):
-        old = None
-        if self.restore_clipboard:
-            try:
-                r = subprocess.run(["wl-paste", "--no-newline", "--type", "text/plain"],
-                                   capture_output=True, timeout=2)
-                old = r.stdout if r.returncode == 0 else None
-            except subprocess.TimeoutExpired:       # clipboard owner not responding
-                print("  could not read the clipboard, it won't be restored", flush=True)
+        # gated once, before the clipboard is touched: waiting between the copy and
+        # Ctrl+V would leave the fragment in the clipboard for a whole recording
+        self.gate()
+        old = self._save_clipboard() if self.restore_clipboard else None
         subprocess.run(["wl-copy", "--type", "text/plain;charset=utf-8", "--", text],
                        check=True, timeout=5)
         time.sleep(0.15)                            # let the compositor see the new selection
         self._keys(PASTE_KEYS[self.paste_keys].split())
         if old is not None:
             time.sleep(0.5)                         # let the target app read the clipboard
+            mime, data = old
             try:
-                subprocess.run(["wl-copy", "--type", "text/plain;charset=utf-8"], input=old,
-                               timeout=5, check=False)
+                subprocess.run(["wl-copy", "--type", mime], input=data, timeout=5, check=False)
             except subprocess.TimeoutExpired:
                 print("  could not restore the clipboard", flush=True)
+
+    @staticmethod
+    def _save_clipboard() -> tuple[str, bytes] | None:
+        """(mime type, data) of the clipboard, or None if it is empty or unreadable.
+
+        wl-copy can offer only one type, so one is chosen: copied files (GNOME's file
+        list type - file managers also offer them as text), else text, else the first
+        real mime type (an image, ...).
+        """
+        try:
+            r = subprocess.run(["wl-paste", "--list-types"], capture_output=True, text=True,
+                               timeout=2)
+            types = r.stdout.splitlines() if r.returncode == 0 else []
+            mime = (next((t for t in CLIPBOARD_FILE_TYPES if t in types), None)
+                    or next((t for t in CLIPBOARD_TEXT_TYPES if t in types), None)
+                    or next((t for t in types if "/" in t), None))
+            if mime is None:
+                return None
+            r = subprocess.run(["wl-paste", "--no-newline", "--type", mime], capture_output=True,
+                               timeout=2)
+            return (mime, r.stdout) if r.returncode == 0 else None
+        except subprocess.TimeoutExpired:           # clipboard owner not responding
+            print("  could not read the clipboard, it won't be restored", flush=True)
+            return None
 
 
 # =========================================================================== #
@@ -346,23 +405,30 @@ def lang_code(tok: str) -> str:
     return tok.strip().strip("<|>").split("-")[0].lower()
 
 
-def speech_stats(audio) -> tuple[float, float]:
-    """(seconds of speech, loudest frame RMS) - a simple energy-based voice detector.
+def speech_stats(audio, floors=()) -> tuple[float, float, float]:
+    """(seconds of speech, loudest frame RMS, noise floor of this clip) - a simple
+    energy-based voice detector.
 
     A 30 ms frame counts as speech when it is louder than SPEECH_RMS_MIN and 3x the
-    noise floor (20th percentile of all frames), so it adapts to the mic's gain and
-    background noise. Unlike the RMS of the whole clip, a short or quiet word in a
-    mostly silent recording still counts.
+    noise floor, so it adapts to the mic's gain and background noise. The noise
+    floor is the 20th percentile of the clip's frames (exact digital silence left
+    out), or the lowest floor of the last few recordings (`floors`) if that is lower: when the key is held tightly
+    around a single word, the whole clip is speech and its own 20th percentile is
+    far above the real noise. Unlike the RMS of the whole clip, a short or quiet
+    word in a mostly silent recording still counts.
     """
     import numpy as np
 
     frame = int(FRAME_SECONDS * SAMPLE_RATE)
     n = len(audio) // frame
     if n == 0:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
     rms = np.sqrt(np.mean(audio[:n * frame].reshape(n, frame) ** 2, axis=1))
-    threshold = max(SPEECH_RMS_MIN, 3 * float(np.percentile(rms, 20)))
-    return float((rms > threshold).sum() * FRAME_SECONDS), float(rms.max())
+    # digital silence (a Bluetooth mic waking up) says nothing about the room's noise
+    real = rms[rms > NOISE_FLOOR_MIN]
+    floor = float(np.percentile(real, 20)) if len(real) else 0.0
+    threshold = max(SPEECH_RMS_MIN, 3 * min([floor, *floors]))
+    return float((rms > threshold).sum() * FRAME_SECONDS), float(rms.max()), floor
 
 
 class Transcriber:
@@ -441,7 +507,9 @@ class Transcriber:
         lang = self.choose_language(audio, speech_seconds)
         res = self.pipe.generate(audio.tolist(), task="transcribe", language=f"<|{lang}|>")
         text = res.texts[0].strip()
-        if text.lower() in HALLUCINATIONS:
+        if text.lower() in HALLUCINATIONS or (text.lower() in SHORT_HALLUCINATIONS and
+                                              speech_seconds < SHORT_HALLUCINATION_SPEECH):
+            print(f"  dropped {text!r} (Whisper hallucinates it in noise)", flush=True)
             text = ""
         return text, lang, time.monotonic() - t0
 
@@ -491,14 +559,16 @@ class Recorder:
 
         self.np, self.sd = np, sd
         self.preferred, self.on_limit = preferred, on_limit
-        self.stream = None
+        self.stream, self.skip = None, 0
         self.chunks: list = []
         self.lock = threading.Lock()
 
-    def start(self):
+    def start(self, skip: float = 0.0):
         """Start recording from the preferred mic, else the system default.
-        Raises only if the system default can't be opened either."""
+        Raises only if the system default can't be opened either.
+        skip: seconds dropped from the start of the recording (the start sound)."""
         self.chunks, self.started, self.limit_hit = [], time.monotonic(), False
+        self.skip = int(skip * SAMPLE_RATE)
         node = self.preferred
         if node:
             # checked on every press: the preferred mic may have been unplugged or plugged in
@@ -554,82 +624,134 @@ class Recorder:
             self.stream = None
         with self.lock:
             chunks, self.chunks = self.chunks, []
-        return self.np.concatenate(chunks) if chunks else self.np.zeros(0, self.np.float32)
+        audio = self.np.concatenate(chunks) if chunks else self.np.zeros(0, self.np.float32)
+        return audio[self.skip:]
 
 
 # =========================================================================== #
 # Daemon: state machine + socket server
 # =========================================================================== #
 class Daemon:
-    """idle --press--> recording --release--> transcribing --(typed)--> idle
+    """Recording and transcribing overlap: the next dictation can start while the
+    previous one is still being transcribed.
 
-    Socket commands are handled one at a time; transcription runs in a thread so
-    the socket stays responsive (e.g. for `status`).
+    release queues the recording; one worker thread transcribes and types the
+    recordings in order. Text is only typed while no recording runs - a held
+    RIGHTCTRL/RIGHTMETA dictation key would otherwise turn the typed characters
+    into shortcuts - so typing pauses (between whole characters) when one starts.
+    Socket commands are handled one at a time in the main thread.
     """
 
     def __init__(self, args):
         self.args = args
         self.lock = threading.Lock()
-        self.state = "loading"
+        self.mic_free = threading.Condition(self.lock)    # notified when a recording ends
+        self.recording = False
+        self.limit_stopped = False    # the time limit ended the recording, not the user
+        self.pending = 0                                  # recordings not yet typed
+        self.jobs: queue.SimpleQueue = queue.SimpleQueue()
+        self.floors = collections.deque(maxlen=5)          # noise floors of recent clips
         t0 = time.monotonic()
         languages = [lang_code(x) for x in args.languages.split(",") if x.strip()]
         self.transcriber = Transcriber(
             args.model, args.device, args.detect_model, args.detect_device, languages,
             lang_code(args.fallback_language), args.language and lang_code(args.language))
-        self.recorder = Recorder(args.input_device, on_limit=self.release)
+        self.recorder = Recorder(args.input_device, on_limit=self._limit_reached)
         self.keyboard = Keyboard(args.output, args.layout, args.key_delay, args.paste_keys,
-                                 args.restore_clipboard)
+                                 args.restore_clipboard, gate=self._wait_while_recording)
+        threading.Thread(target=self._worker, daemon=True).start()
         lang = (f"forced {args.language}" if args.language else
                 f"auto within {','.join(languages)}, fallback {args.fallback_language}")
         print(f"ready after {time.monotonic() - t0:.1f}s (language: {lang})", flush=True)
-        self.state = "idle"
 
     # ---- commands --------------------------------------------------------- #
+    def status(self) -> str:
+        parts = (["recording"] if self.recording else []) + \
+                ([f"transcribing {self.pending}"] if self.pending else [])
+        return ", ".join(parts) or "idle"
+
     def press(self) -> str:
         with self.lock:
-            if self.state != "idle":
-                return f"busy ({self.state})"
+            if self.recording:
+                return "busy (recording)"
+            self.limit_stopped = False
+            # the mic records the start sound, so that part of the audio is dropped
             try:
-                self.recorder.start()
+                self.recorder.start(skip=SOUND_START_SKIP if self.args.sounds else 0.0)
             except Exception as e:                  # not even the system default mic works
                 print(f"could not start recording: {e!r}", file=sys.stderr, flush=True)
                 return f"error: could not start recording: {e}"
-            self.state = "recording"
+            self.recording = True
         self._sound(SOUND_START)
         return "recording"
 
     def release(self) -> str:
         with self.lock:
-            if self.state != "recording":
-                return f"not recording ({self.state})"
+            if not self.recording:
+                return "not recording"
             audio = self.recorder.stop()
-            self.state = "transcribing"
+            self.recording = False
+            self.pending += 1
+            self.mic_free.notify_all()
         self._sound(SOUND_STOP)
-        threading.Thread(target=self._finish, args=(audio,), daemon=True).start()
+        self.jobs.put(audio)
         return "transcribing"
 
     def toggle(self) -> str:
-        return self.press() if self.state == "idle" else self.release()
+        if self.recording:
+            return self.release()
+        if self.limit_stopped:
+            # the user's "stop" after the time limit already stopped the recording:
+            # don't start a new one
+            self.limit_stopped = False
+            return "not recording (stopped by the time limit)"
+        return self.press()
+
+    def _limit_reached(self):
+        print(f"  recording stopped after the {MAX_SECONDS} s limit", flush=True)
+        with self.lock:
+            self.limit_stopped = self.recording
+        self.release()
 
     def cancel(self) -> str:
         with self.lock:
-            if self.state != "recording":
-                return f"nothing to cancel ({self.state})"
+            if not self.recording:
+                return "nothing to cancel"
             self.recorder.stop()
-            self.state = "idle"
+            self.recording = False
+            self.mic_free.notify_all()
         return "cancelled"
 
     def handle(self, cmd: str) -> str:
-        print(f"command: {cmd} (state: {self.state})", flush=True)
+        print(f"command: {cmd} ({self.status()})", flush=True)
         actions = {"press": self.press, "release": self.release, "toggle": self.toggle,
-                   "cancel": self.cancel, "status": lambda: self.state}
+                   "cancel": self.cancel, "status": self.status}
         return actions[cmd]() if cmd in actions else f"error: unknown command {cmd!r}"
 
     # ---- transcription ---------------------------------------------------- #
+    def _worker(self):
+        while True:
+            audio = self.jobs.get()
+            try:
+                self._finish(audio)
+            finally:
+                with self.lock:
+                    self.pending -= 1
+
+    def _wait_while_recording(self):
+        with self.mic_free:
+            if self.recording:
+                print("  typing paused while recording", flush=True)
+            self.mic_free.wait_for(lambda: not self.recording)
+
     def _finish(self, audio):
         try:
             secs = len(audio) / SAMPLE_RATE
-            speech, peak = speech_stats(audio)
+            speech, peak, floor = speech_stats(audio, self.floors)
+            # only clips of 1 s+ with real audio measure the noise reliably; a short tap
+            # would otherwise drag the threshold down for the next recordings
+            if secs >= 1.0 and floor > NOISE_FLOOR_MIN:
+                self.floors.append(floor)
             levels = f"{secs:.1f}s audio, {speech:.1f}s speech, peak {peak:.3f}"
             sound = (abs(audio) > 1e-6).nonzero()[0]
             startup = (sound[0] if len(sound) else len(audio)) / SAMPLE_RATE
@@ -646,8 +768,6 @@ class Daemon:
                 self.keyboard.write(text + (" " if self.args.trailing_space else ""))
         except Exception as e:                      # keep the daemon alive
             print(f"dictation failed: {e!r}", file=sys.stderr, flush=True)
-        finally:
-            self.state = "idle"
 
     def _sound(self, path: str):
         if self.args.sounds and os.path.exists(path):

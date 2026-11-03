@@ -8,7 +8,7 @@ This document explains every part of npu-voice-to-text and why it is built the w
           ┌──────────────── root ────────────────┐   ┌───────────────────── your user ─────────────────────┐
 keyboard ─▶ npu-voice-to-text-keywatch                  │   │ npu-voice-to-text serve (systemd user service)            │
  F8 down  │  reads /dev/input/event*              │   │                                                     │
- F8 up    │  "press" / "release" ────────────────────▶│ Daemon ── idle → recording → transcribing → idle    │
+ F8 up    │  "press" / "release" ────────────────────▶│ Daemon ── recording → queue → transcribe → type     │
           └──────────────────────────────────────┘ socket │                                                  │
                                     /run/user/UID/npu-voice-to-text.sock                                          │
                                                        │   Recorder     mic → 16 kHz mono buffer (PortAudio)  │
@@ -45,6 +45,7 @@ Typical timing for a 5 s sentence: ~0.5 s language detection + ~1.6 s transcript
 | `~/.cache/npu-voice-to-text` | Compiled model blobs, so later starts take seconds instead of minutes |
 | `~/.config/npu-voice-to-text/options` | `serve` options, one per line, e.g. the microphone (written by `install.sh`) |
 | `tools/microphones.py` | Lists microphones for `install.sh` |
+| `tools/remove-keywatch.sh` | Removes the key watcher (`install.sh` when switching to toggle mode, `uninstall.sh`) |
 | `$XDG_RUNTIME_DIR/npu-voice-to-text.sock` | Control socket (mode 0600) |
 
 ---
@@ -73,13 +74,13 @@ The unit hardening (`CapabilityBoundingSet=CAP_DAC_OVERRIDE`, `ProtectSystem=str
 
 | Command | Effect | Reply |
 |---|---|---|
-| `press` | start recording, if idle | `recording` or `busy (…)` |
-| `release` | stop recording and transcribe in the background | `transcribing` or `not recording (…)` |
-| `toggle` | `press` when idle, otherwise `release` | |
+| `press` | start recording, unless one is running | `recording`, `busy (recording)` or `error: …` |
+| `release` | stop recording and queue it for transcription | `transcribing` or `not recording` |
+| `toggle` | `release` while recording, otherwise `press` | |
 | `cancel` | stop recording and discard it | `cancelled` |
-| `status` | | `idle` / `recording` / `transcribing` |
+| `status` | | `idle`, `recording`, `transcribing N` or `recording, transcribing N` |
 
-`npu-voice-to-text press|release|toggle|cancel|status` is the client. It only imports the standard library, so it reacts instantly when bound to a shortcut. A press during `transcribing` is refused, so two dictations never type over each other.
+`npu-voice-to-text press|release|toggle|cancel|status` is the client. It only imports the standard library, so it reacts instantly when bound to a shortcut. A press while the previous dictation is still being transcribed starts the next recording right away. Recordings are transcribed and typed one at a time, in order, so two dictations never type over each other. Text is only typed while no recording runs: with RIGHTCTRL or RIGHTMETA as the hold key, typing while the key is held would turn the characters into shortcuts. Typing therefore pauses when a recording starts. It runs one `ydotool` call per character (about 0.4 ms each) and checks before each one, so it pauses between whole characters and never leaves Shift or AltGr held down. Only the character being typed at the moment of the key press can still be hit (about 20 ms). A `toggle` after the 120 s limit already stopped the recording doesn't start a new one.
 
 Why a socket and not D-Bus or signals: it needs no extra dependencies, the permissions are simply file permissions, and root (the key watcher) can reach it without joining your session bus.
 
@@ -93,7 +94,7 @@ Why that matters: if the default mic is a Bluetooth headset, opening it switches
 
 Safety rules:
 - Recordings stop by themselves after 120 s, for example if a key gets stuck.
-- **Is there speech at all?** The recording is cut into 30 ms frames. A frame counts as speech if it's louder than 0.002 RMS *and* 3× the noise floor (the 20th percentile of all frames), so the check adapts to mic gain and background noise. Recordings with under 0.15 s of speech (an accidental tap, the click of the key itself, silence) are never sent to Whisper, which would hallucinate on them (see below).
+- **Is there speech at all?** The recording is cut into 30 ms frames. A frame counts as speech if it's louder than 0.002 RMS *and* 3× the noise floor, so the check adapts to mic gain and background noise. The noise floor is the 20th percentile of the clip's frames (exact digital silence left out), or the lowest floor of the last 5 recordings of 1 s or more if that is lower: if the key is held tightly around a single word like "Ja", the whole clip is speech, and its own 20th percentile would put the threshold above the word. Recordings with under 0.15 s of speech (an accidental tap, the click of the key itself, silence) are never sent to Whisper, which would hallucinate on them (see below).
 - An earlier version averaged the volume over the *whole* clip. A single quiet word with a second of silence around it then averaged out below the threshold and was silently dropped. The log line `[2.8s audio, 0.4s speech, peak 0.020, …]` shows the measured values for every recording.
 
 ### Transcriber
@@ -114,7 +115,7 @@ Safety rules:
 
 Comparing how confident the model is with each language forced (de vs en) would be the better test for short clips. OpenVINO GenAI's Whisper pipeline returns no usable scores for that, though (`scores` is always 1.0).
 
-**Hallucination filter.** On silence or noise, Whisper produces phrases it saw a lot in training, such as "Untertitel der Amara.org-Community" or "Thanks for watching!". Exact matches of known ones are dropped.
+**Hallucination filter.** On silence or noise, Whisper produces phrases it saw a lot in training, such as "Untertitel der Amara.org-Community" or "Thanks for watching!". Exact matches of known ones are dropped. Phrases people also really say ("Vielen Dank.", "Thank you.", "you") are only dropped when the clip had under 0.3 s of speech, i.e. a click or breath that just passed the speech detector.
 
 ### Keyboard (text output)
 
@@ -123,9 +124,9 @@ Wayland doesn't let one app type into another. `ydotool` works around that one l
 **ydotool only sends key codes, not characters.** Its own `type` command assumes a US layout. On German that turns `y` into `z`, and umlauts don't work at all. So npu-voice-to-text computes the key codes itself:
 1. It reads the active input source from GNOME (`gsettings org.gnome.desktop.input-sources`), e.g. `de`.
 2. It compiles that layout with **libxkbcommon** (via `ctypes`), the same library GNOME uses to turn key codes into characters.
-3. It walks every key and every shift level and records which key code + Shift/AltGr produces each character. It only uses the main typing block (plus space, `<>|`, and the Japanese/Brazilian RO and YEN keys). Characters only found on the keypad or on exotic keys like `KEY_EURO` (€ on `us`) are pasted instead, because many apps ignore those keys. If several keys produce the same character, it prefers fewer modifiers.
+3. It walks every key and every shift level and records which key code + Shift/AltGr produces each character. AltGr is whichever key produces `ISO_Level3_Shift` in that keymap: Right Alt normally, another key with options like `lv3:caps_switch`. If options like `compose:ralt` leave no real key for it (xkb's virtual `<LVL3>` key doesn't count, since `ydotoold` can't send it), AltGr characters are pasted. It only uses the main typing block (plus space, `<>|`, and the Japanese/Brazilian RO and YEN keys). Characters only found on the keypad or on exotic keys like `KEY_EURO` (€ on `us`) are pasted instead, because many apps ignore those keys. If several keys produce the same character, it prefers fewer modifiers.
 4. It also records **dead keys** (`´`, `` ` ``, `^`, …). A character with no key of its own is split with Unicode NFD (`é` → `e` + U+0301) and typed as dead key + base letter. A bare `^` is dead key + space.
-5. Characters the layout can't produce at all (emoji, `ñ` on German) are pasted through the clipboard (`wl-copy` + Ctrl+V), and the previous clipboard text is restored afterwards.
+5. Characters the layout can't produce at all (emoji, `ñ` on German) are pasted through the clipboard (`wl-copy` + Ctrl+V), and the previous clipboard content is restored afterwards. `wl-copy` can only offer one type, so one is restored: GNOME's file list if files were copied, otherwise text, otherwise the first type (an image, …).
 
 Newlines become spaces (Enter would send chat messages). Events are sent 4 ms apart, which is roughly 1 s for 50 words. A few apps need `--key-delay 8`.
 

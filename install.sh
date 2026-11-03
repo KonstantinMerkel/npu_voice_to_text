@@ -112,7 +112,7 @@ create_options() {
 # After editing: systemctl --user restart npu-voice-to-text
 EOF
 }
-current_mic=$(sed -n 's/^--input-device[ =]//p' "$OPTIONS" 2>/dev/null | head -1)
+current_mic=$(sed -n 's/^--input-device[ =]//p' "$OPTIONS" 2>/dev/null | head -1 || true)
 mapfile -t MICS < <(python3 -I "$SRC/tools/microphones.py" 2>/dev/null || true)
 if (( ${#MICS[@]} == 0 )); then
     create_options
@@ -205,6 +205,12 @@ EOF
 [[ "$(ask "Use hold-to-talk? [Y/n]")" == [nN]* ]] && mode=toggle || mode=hold
 
 current=$(sed -n 's/^KEY=//p' "$KEYWATCH_ENV" 2>/dev/null || true)
+if [[ -z $current ]]; then          # toggle mode: the key is in the GNOME shortcut
+    bound=$(python3 -I "$SRC/tools/gnome-shortcut.py" get 2>/dev/null || true)
+    for k in "${!KEYACCEL[@]}"; do
+        [[ -n $bound && ${KEYACCEL[$k]} == "$bound" ]] && current=$k
+    done
+fi
 echo "    keys: F1-F12, PAUSE, SCROLLLOCK, INSERT, MENU$([[ $mode == hold ]] && echo ", RIGHTCTRL, RIGHTMETA")"
 echo "          (F13-F24 also work, if your keyboard or remapping tool has them)"
 while :; do
@@ -235,12 +241,7 @@ if [[ $mode == hold ]]; then
     fi
     howto="Hold $key, speak, release - the text is typed about 2 s later."
 else
-    if [[ -e "$KEYWATCH_UNIT" ]]; then
-        echo "    removing the key watcher from a previous hold-to-talk install (sudo):"
-        sudo systemctl disable --now --quiet "npu-voice-to-text-keywatch@$(id -u)" || true
-        sudo rm -f "$KEYWATCH_ENV"
-        ok "key watcher removed"
-    fi
+    bash "$SRC/tools/remove-keywatch.sh"     # left over from a hold-to-talk install
     python3 -I "$SRC/tools/gnome-shortcut.py" set "$accel" "$BIN/npu-voice-to-text toggle" \
         && ok "GNOME shortcut $key -> npu-voice-to-text toggle" \
         || die "could not create the shortcut - free up $key in GNOME Settings -> Keyboard and re-run"

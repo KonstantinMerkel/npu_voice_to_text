@@ -15,17 +15,7 @@ rm -f "$UNITS/npu-voice-to-text.service" "$HOME/.local/bin/npu-voice-to-text"
 systemctl --user daemon-reload
 python3 -I "$SRC/tools/gnome-shortcut.py" remove
 
-if [[ -e /etc/systemd/system/npu-voice-to-text-keywatch@.service ]]; then
-    echo "removing the key watcher (sudo)"
-    sudo systemctl disable --now --quiet "npu-voice-to-text-keywatch@$(id -u)"
-    sudo rm -f "/etc/npu-voice-to-text/keywatch-$(id -u).env"
-    sudo rmdir --ignore-fail-on-non-empty /etc/npu-voice-to-text 2>/dev/null
-    # shared by all users - only remove it if nobody else uses it
-    if ! ls /etc/npu-voice-to-text/keywatch-*.env >/dev/null 2>&1; then
-        sudo rm -f /etc/systemd/system/npu-voice-to-text-keywatch@.service /usr/local/bin/npu-voice-to-text-keywatch
-    fi
-    sudo systemctl daemon-reload
-fi
+bash "$SRC/tools/remove-keywatch.sh"
 
 if [[ "${1:-}" == "--all" ]]; then
     rm -rf "$DATA" "$CACHE" "$CONFIG"

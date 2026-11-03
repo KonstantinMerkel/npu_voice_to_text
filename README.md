@@ -76,7 +76,7 @@ Everything except the key watcher goes into your home directory. Re-run `./insta
 | Dictate (hold-to-talk) | Hold your key, speak, release |
 | Dictate (toggle) | Press your key, speak, press it again |
 | Cancel a recording | `npu-voice-to-text cancel` (bind it to a shortcut if you like) |
-| Status | `npu-voice-to-text status` → `idle` / `recording` / `transcribing` |
+| Status | `npu-voice-to-text status` → `idle`, `recording`, `transcribing N` or both |
 | Logs | `journalctl --user -u npu-voice-to-text -f` (transcripts, language, timings) |
 
 Recordings are limited to 120 s. Longer recordings are transcribed in 30 s windows.
@@ -105,7 +105,7 @@ Options go into `~/.config/npu-voice-to-text/options`, one per line (`#` comment
 | `--paste-keys` | `ctrl-v` | `ctrl-shift-v` for terminals. Used for `--output paste` and for characters your layout can't type (emoji). |
 | `--no-trailing-space` | | Don't add a space after each dictation |
 | `--input-device` | set by `install.sh` | Preferred microphone: a PipeWire source name from `pactl list sources short`. Used while connected, otherwise the system default. |
-| `--sounds` | | Start/stop sounds |
+| `--sounds` | | Start/stop sounds. The first 0.4 s of each recording (the start sound) is dropped, so start speaking after it |
 
 **Key and mode:** re-run `./install.sh`. Keys: F1–F24, PAUSE, SCROLLLOCK, INSERT, MENU, and, in hold-to-talk mode only, RIGHTCTRL and RIGHTMETA. A lone modifier produces no input in apps, but it can't be a GNOME shortcut on its own. The hold key is stored in `/etc/npu-voice-to-text/keywatch-<uid>.env` (`KEY=F8`). A numeric evdev code works there too; restart `npu-voice-to-text-keywatch@<uid>` after editing it.
 

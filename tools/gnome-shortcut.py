@@ -6,6 +6,7 @@
   gnome-shortcut.py set ACCELERATOR COMMAND
       e.g.  set F8 true   /   set F8 "~/.local/bin/npu-voice-to-text toggle"
   gnome-shortcut.py remove
+  gnome-shortcut.py get          print the shortcut's key (exit code 1 if there is none)
 
 There is at most one npu-voice-to-text shortcut: the one named npu-voice-to-text. It
 is updated in place instead of adding a duplicate. Shortcuts the user made that
@@ -43,6 +44,12 @@ def entry(path: str) -> str:
 
 
 def main() -> int:
+    if sys.argv[1:] == ["get"]:
+        for p in gs_get(SCHEMA, "custom-keybindings"):
+            if gs_get(entry(p), "name") == NAME:
+                print(gs_get(entry(p), "binding"))
+                return 0
+        return 1
     if len(sys.argv) < 2 or sys.argv[1] not in ("set", "remove") or \
             (sys.argv[1] == "set" and len(sys.argv) != 4):
         sys.exit(__doc__)
