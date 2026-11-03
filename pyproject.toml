@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "npu-voice-to-text"
+dynamic = ["version"]                       # npu_voice_to_text.__version__
+description = "Hold-to-talk dictation for GNOME Wayland, Whisper on the Intel NPU"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+authors = [{ name = "Konstantin Merkel" }]
+requires-python = ">=3.10"
+# openvino-genai must match the Intel NPU libraries fetched by install.sh
+# (linux-npu-driver v1.38 <-> OpenVINO 2026.4). Upgrade both together.
+dependencies = [
+    "openvino-genai~=2026.4.0",
+    "numpy>=2",
+    "sounddevice>=0.5",
+    "huggingface_hub>=1.0",
+]
+
+[project.optional-dependencies]
+# The tests need neither OpenVINO nor a microphone:
+#   uvx --with numpy pytest
+test = ["pytest>=8", "numpy>=2"]
+
+# No [project.scripts]: install.sh writes ~/.local/bin/npu-voice-to-text, which runs
+# `python -I -m npu_voice_to_text`.
+
+[tool.setuptools.dynamic]
+version = { attr = "npu_voice_to_text.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

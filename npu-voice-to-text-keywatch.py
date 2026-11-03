@@ -92,13 +92,18 @@ def watch(code: int, sock_path: str):
                 warned.discard(sk.data)
                 print(f"lost {sk.data}", flush=True)
                 continue
-            for off in range(0, len(data) - INPUT_EVENT.size + 1, INPUT_EVENT.size):
-                _, _, ev_type, ev_code, value = INPUT_EVENT.unpack_from(data, off)
-                if ev_type == EV_KEY and ev_code == code and value in (0, 1):  # 2 = autorepeat
-                    cmd = "press" if value else "release"
-                    if not send(sock_path, cmd):
-                        print(f"{cmd}: npu-voice-to-text not reachable at {sock_path}",
-                              file=sys.stderr, flush=True)
+            for cmd in key_commands(data, code):
+                if not send(sock_path, cmd):
+                    print(f"{cmd}: npu-voice-to-text not reachable at {sock_path}",
+                          file=sys.stderr, flush=True)
+
+
+def key_commands(data: bytes, code: int):
+    """"press" / "release" for each press / release of key `code` in raw input events."""
+    for off in range(0, len(data) - INPUT_EVENT.size + 1, INPUT_EVENT.size):
+        _, _, ev_type, ev_code, value = INPUT_EVENT.unpack_from(data, off)
+        if ev_type == EV_KEY and ev_code == code and value in (0, 1):  # 2 = autorepeat
+            yield "press" if value else "release"
 
 
 def main() -> int:

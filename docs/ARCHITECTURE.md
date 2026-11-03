@@ -33,7 +33,9 @@ Typical timing for a 5 s sentence: ~0.5 s language detection + ~1.6 s transcript
 
 | Path | What |
 |---|---|
-| `npu-voice-to-text.py` → `~/.local/bin/npu-voice-to-text` | Daemon and CLI. The installer rewrites the first line so it runs in the venv. |
+| `src/npu_voice_to_text/` → venv | The daemon and CLI, a Python package (`pyproject.toml`) that `install.sh` installs into the venv (built from a temporary copy, so a stale `build/` can never leak in). See "Code layout" below. |
+| `~/.local/bin/npu-voice-to-text` | A two-line launcher written by `install.sh`: `venv/bin/python -I -m npu_voice_to_text`. `-I` keeps `PYTHONPATH` and the current directory out of the imports. |
+| `tests/` | pytest suite. Needs only `numpy` and libxkbcommon: `uvx --with numpy pytest` |
 | `npu-voice-to-text-keywatch.py` → `/usr/local/bin/npu-voice-to-text-keywatch` | Root key watcher, standard library only |
 | `systemd/npu-voice-to-text.service` → `~/.config/systemd/user/` | User service. Sets `LD_LIBRARY_PATH` to the NPU libs. |
 | `systemd/npu-voice-to-text-keywatch@.service` → `/etc/systemd/system/` | Template unit. The instance name is your UID. |
@@ -47,6 +49,24 @@ Typical timing for a 5 s sentence: ~0.5 s language detection + ~1.6 s transcript
 | `tools/microphones.py` | Lists microphones for `install.sh` |
 | `tools/remove-keywatch.sh` | Removes the key watcher (`install.sh` when switching to toggle mode, `uninstall.sh`) |
 | `$XDG_RUNTIME_DIR/npu-voice-to-text.sock` | Control socket (mode 0600) |
+
+### Code layout
+
+One module per component. Modules marked *stdlib* import only the standard library, so the client commands (bound to a shortcut) start in ~40 ms. `cli` imports `daemon` only for `serve`.
+
+| Module | What | |
+|---|---|---|
+| `cli` | argparse, options file, dispatch to the commands | stdlib |
+| `client` | `request()`: one line to the socket, one line back | stdlib |
+| `paths`, `models` | XDG locations; model ids, `model_path()`, `download` | stdlib |
+| `keyboard` | `XkbKeymap` (layout → keystrokes), `Keyboard` (ydotool, clipboard) | stdlib + ctypes |
+| `audio` | `speech_stats()` (speech detector), `Recorder` (PortAudio) | numpy |
+| `transcriber` | `Transcriber`: language choice, Whisper, hallucination filter | numpy, OpenVINO on `load()` |
+| `daemon` | `Daemon`: state machine, queue, worker, socket server | all of the above |
+
+**Dependencies are passed in.** `Daemon(transcriber, recorder, keyboard)` and `Transcriber(pipe, detector, …)` take their parts as arguments. `Daemon.from_args()` and `Transcriber.load()` build the real ones (NPU, microphone, ydotool). The tests pass fakes instead, so they cover the state machine, recording overlapping transcription, typing pausing while you record, language choice and the socket server without any hardware. The keymap tests use the real libxkbcommon, so they check the actual German and US layouts.
+
+The key watcher stays a single standalone script outside the package: root runs a root-owned copy of it, and it must not import anything from a user-writable venv.
 
 ---
 
@@ -149,7 +169,7 @@ OpenVINO GenAI (WhisperPipeline)                pip, venv
 - verifies the archive's checksum;
 - points only this service at them with `LD_LIBRARY_PATH`.
 
-No system files are replaced, and the firmware still comes from your distro. **Upgrading means bumping `openvino-genai` in `requirements.txt` and `NPU_DRIVER_*` in `install.sh` together.**
+No system files are replaced, and the firmware still comes from your distro. **Upgrading means bumping `openvino-genai` in `pyproject.toml` and `NPU_DRIVER_*` in `install.sh` together.**
 
 How to check the NPU is really used: `cat /sys/bus/pci/devices/0000:00:0b.0/npu_busy_time_us` goes up with every dictation. The PCI address may differ on your machine (`lspci | grep NPU`).
 
@@ -175,3 +195,45 @@ How to check the NPU is really used: `cat /sys/bus/pci/devices/0000:00:0b.0/npu_
 - Caps Lock inverts typed letters (ydotool types keys, not characters).
 - Only one layout group: the first one of the active input source.
 - Tested only on one Arrow Lake laptop with Fedora 44.
+
+---
+
+## Roadmap
+
+**Goal: no root component and no ydotool.** Both are workarounds for things Wayland now offers through desktop portals: global shortcuts with press *and* release, and input injection with the user's consent. Both portals are D-Bus APIs, so they would share one small `portal.py` module (session handling and the portal's Request/Response pattern, with a pure-Python D-Bus library such as `jeepney`). Each one is added behind an option first. The current mechanism stays as the fallback until the portal version has proven itself on real use.
+
+### 1. Hold key: GlobalShortcuts portal (replaces the root key watcher)
+
+[`org.freedesktop.portal.GlobalShortcuts`](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.GlobalShortcuts.html), supported by GNOME since 48:
+
+1. `CreateSession`, then `BindShortcuts` with one shortcut (`dictate`, preferred trigger `F8`). GNOME asks the user once to confirm the key and remembers it.
+2. The signals `Activated` and `Deactivated` (key down / key up) call `Daemon.press()` / `release()` directly. No socket hop, no root service, and no "do-nothing" GNOME shortcut, since the compositor consumes the key itself.
+
+What it removes: `npu-voice-to-text-keywatch`, its systemd unit, `/etc/npu-voice-to-text`, the sudo step in `install.sh` and `tools/remove-keywatch.sh`.
+
+To find out first (a short spike):
+- **Does GNOME emit `Deactivated` on key release, every time?** That is the whole point. If GNOME only emits it right after `Activated`, hold-to-talk can't use the portal, but toggle mode still could.
+- **App identity.** A host app (not Flatpak) needs an app ID for the portal to remember its shortcuts: via `org.freedesktop.host.portal.Registry`, or from the name of the systemd unit / scope it runs in.
+- **Which triggers are allowed.** A lone RIGHTCTRL probably isn't. Those keys would keep the key watcher, or be dropped.
+- **Lifecycle.** The session is tied to the D-Bus connection, so it is re-created after a daemon restart (the binding itself persists).
+
+### 2. Typing: RemoteDesktop portal / libei (replaces ydotool)
+
+[`org.freedesktop.portal.RemoteDesktop`](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html):
+
+1. `CreateSession`, then `SelectDevices` (keyboard, `persist_mode=2`), then `Start`. GNOME asks once for permission. The returned `restore_token` skips the dialog next time. It is single-use, so the new token from every `Start` is saved.
+2. Typing: either `NotifyKeyboardKeysym` (plain D-Bus, one call per key event) or `ConnectToEIS` for a libei connection (lower latency, and the compositor sends its keymap).
+
+What it removes: `ydotoold` (a root daemon whose socket can type anything), its setup in the README, the socket lookup, and one subprocess per character. With **keysyms** the compositor finds the key on the *current* layout. Most of `XkbKeymap`'s reverse mapping, the gsettings layout lookup, the AltGr detection and the Caps Lock limitation could then go away.
+
+To find out first:
+- **Keysyms not on the layout** (emoji, `ñ` on German): does mutter type them, or drop them? If it drops them, the clipboard fallback stays, and something still has to know what the layout can type. libei's keymap from the compositor would be the right source for that, rather than gsettings.
+- **Dead-key characters** (`é` on German): does mutter compose them from a keysym, or must we still send dead key + letter?
+- **The "remote desktop" indicator.** GNOME shows it while a session is open. Is a session kept open for the daemon's lifetime acceptable, or does it need one session per dictation (slower)?
+- The keymap tests in `tests/test_keyboard.py` are the spec: on German, `y`/`z`, `ä ö ü ß`, `@ €`, `„“` and `é` must still come out right.
+
+### Smaller items
+
+- **If the key watcher stays** (other desktops, modifier keys): run it as a dedicated non-root user in the `input` group (`DynamicUser=` + `SupplementaryGroups=input`) instead of root with `CAP_DAC_OVERRIDE`. It would then offer the socket, and the user daemon would connect to it.
+- **Voice detection:** a small VAD model (e.g. Silero VAD on the CPU) instead of the energy detector. It would likely replace the hand-tuned thresholds and most of the hallucination list.
+- **Re-check the CPU language-detection workaround** with every OpenVINO GenAI upgrade. If NPU auto-detection gets fixed, the second model can go.

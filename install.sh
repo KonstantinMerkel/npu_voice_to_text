@@ -3,7 +3,7 @@
 # Copyright (C) 2026 Konstantin Merkel
 # Install or update npu-voice-to-text for the current user. Safe to re-run; re-run it to
 # change the dictation key or the mode. Installed without root:
-#   ~/.local/bin/npu-voice-to-text                     the program
+#   ~/.local/bin/npu-voice-to-text                     launcher for the program in the venv
 #   ~/.local/share/npu-voice-to-text/{venv,lib,models} Python env, Intel NPU libs, Whisper models
 #   ~/.config/systemd/user/npu-voice-to-text.service   the daemon
 # Only for hold-to-talk mode (asks first, uses sudo):
@@ -12,7 +12,7 @@
 set -euo pipefail
 
 # Intel NPU userspace driver + compiler. Must match the OpenVINO version in
-# requirements.txt (see https://github.com/intel/linux-npu-driver/releases).
+# pyproject.toml (see https://github.com/intel/linux-npu-driver/releases).
 NPU_DRIVER_VERSION=1.38.0
 NPU_DRIVER_URL=https://github.com/intel/linux-npu-driver/releases/download/v1.38.0/linux-npu-driver-v1.38.0.20260910-34487311128-ubuntu2604.tar.gz
 NPU_DRIVER_SHA256=83685e6d92f4db1ca65e442846d487c7feb1335634b33994292ceb38f933bcc7
@@ -57,7 +57,16 @@ else warn "ydotoold is not running - nothing can be typed until it is (see READM
 step "Python environment"
 python3 -m venv "$DATA/venv"
 "$DATA/venv/bin/pip" install --quiet --upgrade pip
-"$DATA/venv/bin/pip" install --quiet -r "$SRC/requirements.txt"
+# the npu_voice_to_text package and its dependencies (pyproject.toml). pip reinstalls
+# a local directory on every run, so re-running install.sh updates the program.
+# Built from a fresh copy: setuptools builds inside the source tree and reuses an
+# old build/ there, so modules deleted or renamed since would still be installed.
+# This also leaves the checkout untouched (it may be read-only).
+build=$(mktemp -d)
+trap 'rm -rf "$build"' EXIT
+cp -r "$SRC/pyproject.toml" "$SRC/README.md" "$SRC/src" "$build/"
+"$DATA/venv/bin/pip" install --quiet "$build"
+rm -rf "$build"
 ok "$DATA/venv (openvino-genai $("$DATA/venv/bin/python" -I -c 'import openvino_genai as g; print(g.__version__.split("-")[0])'))"
 
 # --------------------------------------------------------------------------- #
@@ -87,8 +96,14 @@ ok "OpenVINO sees the NPU (devices: $devices)"
 
 # --------------------------------------------------------------------------- #
 step "Program and models"
-install -Dm755 "$SRC/npu-voice-to-text.py" "$BIN/npu-voice-to-text"
-sed -i "1s|.*|#!$DATA/venv/bin/python -I|" "$BIN/npu-voice-to-text"     # run inside the venv
+# a launcher instead of pip's entry-point script: -I keeps PYTHONPATH and the
+# current directory out of the program's imports
+# (%q quotes the path for bash; rm first so an old symlink isn't written through)
+mkdir -p "$BIN"
+rm -f "$BIN/npu-voice-to-text"
+printf '#!/bin/bash\nexec %q -I -m npu_voice_to_text "$@"\n' "$DATA/venv/bin/python" \
+    > "$BIN/npu-voice-to-text"
+chmod 755 "$BIN/npu-voice-to-text"
 ok "$BIN/npu-voice-to-text"
 for model in "$MODEL" "$DETECT_MODEL"; do
     if [[ -e "$DATA/models/${model##*/}/openvino_encoder_model.xml" ]]; then

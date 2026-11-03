@@ -55,7 +55,7 @@ git clone https://github.com/KonstantinMerkel/npu_voice_to_text && cd npu_voice_
 
 The installer:
 1. checks the requirements;
-2. creates a Python venv;
+2. creates a Python venv and installs the program into it;
 3. fetches Intel's NPU driver and compiler (checksum-verified);
 4. checks that OpenVINO sees the NPU;
 5. downloads the two Whisper models (~1.1 GB);
@@ -138,7 +138,7 @@ key down/up ─▶ npu-voice-to-text-keywatch (root) ─▶ socket ─▶ npu-vo
 | Problem | Fix |
 |---|---|
 | `NPU` missing from the installer's device list | Check `ls -l /dev/accel/accel0` and that NPU firmware is installed (`dmesg \| grep intel_vpu`). |
-| `Compilation failed … vclAllocatedExecutableCreate2` | The NPU compiler doesn't match OpenVINO. Upgrade `requirements.txt` and `NPU_DRIVER_*` in `install.sh` together, then re-run it. |
+| `Compilation failed … vclAllocatedExecutableCreate2` | The NPU compiler doesn't match OpenVINO. Upgrade `openvino-genai` in `pyproject.toml` and `NPU_DRIVER_*` in `install.sh` together, then re-run it. |
 | Holding the key does nothing | `journalctl -u npu-voice-to-text-keywatch@$(id -u)` should list your keyboards, and `journalctl --user -u npu-voice-to-text -f` should show `command: press`. On laptops, the F-keys are often media keys: use Fn or FnLock, or pick another key. |
 | Short words get lost, or the start of sentences is missing | The log says `warning: the microphone delivered nothing for the first …s`. Typically that's a Bluetooth headset switching modes. Set another preferred mic with `./install.sh`, or change the system default. |
 | "Nothing heard" although you spoke | Check the log line `[… speech, peak …]`. A peak below ~0.005 means the mic is too quiet or muted (a laptop's built-in mic with the lid closed, for example). Pick another mic or raise its input volume. |
@@ -146,7 +146,7 @@ key down/up ─▶ npu-voice-to-text-keywatch (root) ─▶ socket ─▶ npu-vo
 | Wrong characters | The log prints `keymap <layout>`. Set `--layout` if that's wrong. Check that Caps Lock is off. |
 | Characters missing | Raise `--key-delay` to 8–12. |
 | English comes out as German | Don't use `--language`. See also Known issues. |
-| "Untertitel der Amara.org-Community" etc. | A Whisper hallucination on silence. Add it to `HALLUCINATIONS` in `npu-voice-to-text.py`. |
+| "Untertitel der Amara.org-Community" etc. | A Whisper hallucination on silence. Add it to `HALLUCINATIONS` in `src/npu_voice_to_text/transcriber.py` and re-run `./install.sh`. |
 
 
 ## Known issues
@@ -154,6 +154,20 @@ key down/up ─▶ npu-voice-to-text-keywatch (root) ─▶ socket ─▶ npu-vo
 - **Whisper on the NPU keeps the first detected language** (OpenVINO GenAI 2026.4). Every later recording is transcribed, or rather translated, in that language. That's why the language is detected by a separate small model on the CPU (~0.5 s) and passed to the NPU explicitly. Upstream issue: *(link once filed)*.
 - Whisper can't identify the language of one or two words. Short clips therefore use the language of your previous dictation, so a single word right after switching languages may come out in (or translated into) the previous language.
 - The NPU needs fixed input sizes, so every recording costs about the same as 30 s of audio (~1.6 s with turbo), even a 2 s one.
+
+
+## Development
+
+The program is the Python package in `src/npu_voice_to_text/` (one module per component, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#files)). The tests need neither the NPU, OpenVINO nor a microphone, only `numpy` and libxkbcommon:
+
+```bash
+uvx --with numpy pytest
+# or with the installed venv:
+~/.local/share/npu-voice-to-text/venv/bin/pip install pytest
+~/.local/share/npu-voice-to-text/venv/bin/python -m pytest
+```
+
+After a change, re-run `./install.sh`. It builds the package from a fresh copy of `src/`; a bare `pip install .` in the checkout can reuse a stale `build/` directory and install modules you deleted.
 
 
 ## Uninstall
