@@ -101,49 +101,71 @@ done
 
 # --------------------------------------------------------------------------- #
 step "Microphone"
-if [[ ! -e "$OPTIONS" ]]; then
+# created only once a choice is made, so an install aborted at the prompt still
+# counts as a first install next time
+fresh=$([[ -e "$OPTIONS" ]] && echo 0 || echo 1)
+create_options() {
+    [[ -e "$OPTIONS" ]] && return
     mkdir -p "${OPTIONS%/*}"
     cat > "$OPTIONS" <<'EOF'
 # Options for `npu-voice-to-text serve`, one per line - see `npu-voice-to-text serve --help`.
 # After editing: systemctl --user restart npu-voice-to-text
 EOF
-fi
-current_mic=$(sed -n 's/^--input-device[ =]//p' "$OPTIONS" | head -1)
+}
+current_mic=$(sed -n 's/^--input-device[ =]//p' "$OPTIONS" 2>/dev/null | head -1)
 mapfile -t MICS < <(python3 -I "$SRC/tools/microphones.py" 2>/dev/null || true)
 if (( ${#MICS[@]} == 0 )); then
-    warn "could not list microphones (is pactl installed?) - using the system default"
+    create_options
+    warn "could not list microphones (is pactl installed?) - dictation uses the system default"
 else
-    # suggestion: the current choice > the system default > the first one, but never
-    # Bluetooth or an empty jack (unless that's all there is)
-    names=(); current=""; default=""; first=""
+    cat <<'EOF'
+    Dictation records from the preferred microphone while it is connected, and from
+    the system default (your desktop's sound settings) otherwise. Bluetooth headsets
+    switch into a low-quality headset mode when their mic opens; that takes ~1 s, so
+    the start of every dictation is lost. Prefer a wired or built-in mic.
+EOF
+    printf '    0) None - always the system default\n'
+    names=(); descs=(); current=""; default=""; first=""
     for i in "${!MICS[@]}"; do
         IFS=$'\t' read -r name desc bus is_default plugged <<<"${MICS[$i]}"
-        names+=("$name")
+        names+=("$name"); descs+=("$desc")
         notes=""
-        [[ $is_default == 1 ]]       && notes+=", system default"
+        [[ $is_default == 1 ]]        && notes+=", system default"
         [[ $name == "$current_mic" ]] && notes+=", current"
-        [[ $bus == bluetooth ]]      && notes+=", Bluetooth: not recommended"
-        [[ $plugged == 0 ]]          && notes+=", nothing plugged in"
+        [[ $bus == bluetooth ]]       && notes+=", Bluetooth: not recommended"
+        [[ $plugged == 0 ]]           && notes+=", nothing plugged in"
         printf '    %d) %s%s\n' $((i + 1)) "$desc" "${notes:+  [${notes#, }]}"
         usable=$([[ $bus != bluetooth && $plugged == 1 ]] && echo 1 || echo 0)
         [[ $name == "$current_mic" ]] && current=$((i + 1))
         [[ $usable == 1 && $is_default == 1 ]] && default=$((i + 1))
         [[ $usable == 1 && -z $first ]] && first=$((i + 1))
     done
-    suggested=${current:-${default:-${first:-1}}}
-    echo "    Bluetooth headsets switch into a low-quality headset mode when their mic opens;"
-    echo "    that takes ~1 s, so the start of every dictation is lost. Prefer a wired or built-in mic."
+    if [[ -n $current_mic && -z $current ]]; then     # preferred mic, unplugged right now
+        names+=("$current_mic"); descs+=("$current_mic")
+        current=${#names[@]}
+        printf '    %d) %s  [current, not connected]\n' "$current" "$current_mic"
+    fi
+    # suggestion: the current choice; None if that was chosen before; on a first
+    # install a wired/built-in mic (the system default if it is one), so dictation
+    # doesn't follow the default to Bluetooth earbuds connected later
+    if [[ -n $current ]]; then suggested=$current
+    elif (( ! fresh )); then suggested=0
+    else suggested=${default:-${first:-0}}; fi
     while :; do
-        pick=$(ask "Microphone [${suggested:-1}]:")
-        pick=${pick:-${suggested:-1}}
-        [[ $pick =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= ${#names[@]} )) && break
-        warn "enter a number between 1 and ${#names[@]}"
+        pick=$(ask "Preferred microphone [$suggested]:")
+        pick=${pick:-$suggested}
+        # 10#: a leading zero would make bash read the number as octal
+        [[ $pick =~ ^[0-9]+$ ]] && pick=$((10#$pick)) && (( pick <= ${#names[@]} )) && break
+        warn "enter a number between 0 and ${#names[@]}"
     done
-    mic=${names[$((pick - 1))]}
+    create_options
     sed -i '/^--input-device/d' "$OPTIONS"
-    echo "--input-device $mic" >> "$OPTIONS"
-    IFS=$'\t' read -r _ desc _ _ <<<"${MICS[$((pick - 1))]}"
-    ok "using $desc (saved in $OPTIONS)"
+    if (( pick == 0 )); then
+        ok "no preferred microphone - always the system default"
+    else
+        echo "--input-device ${names[$((pick - 1))]}" >> "$OPTIONS"
+        ok "preferred: ${descs[$((pick - 1))]}, otherwise the system default (saved in $OPTIONS)"
+    fi
 fi
 
 # --------------------------------------------------------------------------- #

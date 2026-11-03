@@ -59,7 +59,7 @@ The installer:
 3. fetches Intel's NPU driver and compiler (checksum-verified);
 4. checks that OpenVINO sees the NPU;
 5. downloads the two Whisper models (~1.1 GB);
-6. asks for the **microphone**. Avoid Bluetooth headsets: opening their mic switches them into headset mode, which takes ~1 s, so the start of every dictation (or a whole single word) is lost. Empty jacks are marked.
+6. asks for the **preferred microphone** (or none). It's used while connected; otherwise, or with none, dictation records from the system default mic set in your desktop's sound settings. With none, dictation follows that default, also to Bluetooth earbuds when they connect, so the installer suggests a wired or built-in mic. Avoid Bluetooth headsets: opening their mic switches them into headset mode, which takes ~1 s, so the start of every dictation (or a whole single word) is lost. Empty jacks are marked.
 7. starts the systemd user service and waits until it's ready. The first start compiles the model for the NPU, which takes a few minutes.
 8. asks for the **mode** and the **key**:
    - **hold-to-talk** (default): hold the key while speaking. Needs a small root service that reads the keyboards (sudo, see [Privacy and security](#privacy-and-security)).
@@ -104,8 +104,8 @@ Options go into `~/.config/npu-voice-to-text/options`, one per line (`#` comment
 | `--key-delay` | `4` | ms between key events. Raise it if an app drops characters. |
 | `--paste-keys` | `ctrl-v` | `ctrl-shift-v` for terminals. Used for `--output paste` and for characters your layout can't type (emoji). |
 | `--no-trailing-space` | | Don't add a space after each dictation |
-| `--input-device` | set by `install.sh` | Microphone: a PipeWire source name from `pactl list sources short`. Without it, the system default is used. |
-| `--sounds` / `--quiet` | | Start/stop sounds / no notifications |
+| `--input-device` | set by `install.sh` | Preferred microphone: a PipeWire source name from `pactl list sources short`. Used while connected, otherwise the system default. |
+| `--sounds` | | Start/stop sounds |
 
 **Key and mode:** re-run `./install.sh`. Keys: F1–F24, PAUSE, SCROLLLOCK, INSERT, MENU, and, in hold-to-talk mode only, RIGHTCTRL and RIGHTMETA. A lone modifier produces no input in apps, but it can't be a GNOME shortcut on its own. The hold key is stored in `/etc/npu-voice-to-text/keywatch-<uid>.env` (`KEY=F8`). A numeric evdev code works there too; restart `npu-voice-to-text-keywatch@<uid>` after editing it.
 
@@ -140,7 +140,7 @@ key down/up ─▶ npu-voice-to-text-keywatch (root) ─▶ socket ─▶ npu-vo
 | `NPU` missing from the installer's device list | Check `ls -l /dev/accel/accel0` and that NPU firmware is installed (`dmesg \| grep intel_vpu`). |
 | `Compilation failed … vclAllocatedExecutableCreate2` | The NPU compiler doesn't match OpenVINO. Upgrade `requirements.txt` and `NPU_DRIVER_*` in `install.sh` together, then re-run it. |
 | Holding the key does nothing | `journalctl -u npu-voice-to-text-keywatch@$(id -u)` should list your keyboards, and `journalctl --user -u npu-voice-to-text -f` should show `command: press`. On laptops, the F-keys are often media keys: use Fn or FnLock, or pick another key. |
-| Short words get lost, or the start of sentences is missing | The log says `warning: the microphone delivered nothing for the first …s`. Typically that's a Bluetooth headset switching modes. Pick another mic with `./install.sh`. |
+| Short words get lost, or the start of sentences is missing | The log says `warning: the microphone delivered nothing for the first …s`. Typically that's a Bluetooth headset switching modes. Set another preferred mic with `./install.sh`, or change the system default. |
 | "Nothing heard" although you spoke | Check the log line `[… speech, peak …]`. A peak below ~0.005 means the mic is too quiet or muted (a laptop's built-in mic with the lid closed, for example). Pick another mic or raise its input volume. |
 | Nothing typed / wrong window | Check `ydotool key 42:1 42:0` and `systemctl status ydotool`. Text goes to the window focused at **release**. |
 | Wrong characters | The log prints `keymap <layout>`. Set `--layout` if that's wrong. Check that Caps Lock is off. |

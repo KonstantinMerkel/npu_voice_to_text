@@ -19,6 +19,7 @@ See docs/ARCHITECTURE.md for how the pieces fit together.
 import argparse
 import ast
 import ctypes
+import json
 import os
 import shlex
 import signal
@@ -448,45 +449,94 @@ class Transcriber:
 # =========================================================================== #
 # Recorder: microphone -> 16 kHz mono float32 buffer
 # =========================================================================== #
-def pipewire_sources() -> list[str]:
-    """Node names of all PipeWire/PulseAudio input sources (empty if pactl is missing)."""
+def connected_sources() -> set[str] | None:
+    """Names of the PipeWire/PulseAudio input sources that can record right now.
+
+    Monitors and analog jacks with nothing plugged in (active port "not available",
+    the same check as tools/microphones.py) are left out. None if pactl is missing
+    or doesn't answer within 1 s - the caller holds the daemon lock, and the key
+    watcher gives up after 3 s.
+    """
     try:
-        out = subprocess.run(["pactl", "list", "sources", "short"], capture_output=True,
-                             text=True, timeout=5).stdout
-    except (OSError, subprocess.TimeoutExpired):
-        return []
-    return [line.split("\t")[1] for line in out.splitlines()
-            if "\t" in line and not line.split("\t")[1].endswith(".monitor")]
+        out = subprocess.run(["pactl", "-f", "json", "list", "sources"], capture_output=True,
+                             text=True, timeout=1, check=True).stdout
+        sources = json.loads(out)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    connected = set()
+    for src in sources:
+        props = src.get("properties", {})
+        if src["name"].endswith(".monitor") or props.get("device.class") == "monitor":
+            continue
+        active = [p for p in src.get("ports", []) if p.get("name") == src.get("active_port")]
+        if not (active and active[0].get("availability") == "not available"):
+            connected.add(src["name"])
+    return connected
 
 
 class Recorder:
-    """Records from one microphone while a dictation is running.
+    """Records from the microphone while a dictation is running.
 
-    input_device: a PipeWire source name (`pactl list sources short`, e.g.
-    alsa_input....Mic1__source) - recorded through PipeWire's ALSA plugin with
-    PIPEWIRE_NODE pointing at it - or anything sounddevice accepts. None = the
-    system default. Avoid Bluetooth headsets: opening their mic switches them to
-    headset mode, which takes ~1 s (the start of the recording is silence).
+    preferred: a PipeWire source name (`pactl list sources short`, e.g.
+    alsa_input....Mic1__source). It is used whenever it is connected; otherwise -
+    or with None - the system default source is used, i.e. whatever is selected in
+    the desktop's sound settings (GNOME, KDE, ... all set PipeWire's default).
+    Avoid Bluetooth headsets: opening their mic switches them to headset mode,
+    which takes ~1 s (the start of the recording is silence).
     """
 
-    def __init__(self, input_device=None, on_limit=None):
-        if input_device and input_device in pipewire_sources():
-            os.environ["PIPEWIRE_NODE"] = input_device   # read by the ALSA plugin on open
-            input_device = "pipewire"
+    def __init__(self, preferred: str | None = None, on_limit=None):
         import numpy as np
         import sounddevice as sd
 
         self.np, self.sd = np, sd
-        self.input_device, self.on_limit = input_device, on_limit
+        self.preferred, self.on_limit = preferred, on_limit
         self.stream = None
         self.chunks: list = []
         self.lock = threading.Lock()
 
     def start(self):
+        """Start recording from the preferred mic, else the system default.
+        Raises only if the system default can't be opened either."""
         self.chunks, self.started, self.limit_hit = [], time.monotonic(), False
-        self.stream = self.sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-                                          device=self.input_device, callback=self._callback)
-        self.stream.start()
+        node = self.preferred
+        if node:
+            # checked on every press: the preferred mic may have been unplugged or plugged in
+            connected = connected_sources()
+            if connected is None:
+                print("  could not list microphones (pactl), trying the preferred one anyway",
+                      flush=True)
+            elif node not in connected:
+                print(f"  preferred microphone {node} is not connected, using the system default",
+                      flush=True)
+                node = None
+        if node:
+            try:
+                self.stream = self._open(node)
+                return
+            except Exception as e:
+                print(f"  preferred microphone {node} failed to open ({e!r}), using the system "
+                      "default", flush=True)
+        self.stream = self._open(None)
+
+    def _open(self, node: str | None):
+        """Open and start a stream on a PipeWire source (None: the system default)."""
+        if node:
+            # read by PipeWire's ALSA plugin when the stream opens. Removed right after,
+            # so programs we start later (pw-play, ydotool) don't inherit it
+            os.environ["PIPEWIRE_NODE"] = node
+        try:
+            stream = self.sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                                         device="pipewire" if node else None,
+                                         callback=self._callback)
+        finally:
+            os.environ.pop("PIPEWIRE_NODE", None)
+        try:
+            stream.start()
+        except Exception:
+            stream.close()
+            raise
+        return stream
 
     def _callback(self, indata, frames, t, status):
         with self.lock:
@@ -539,7 +589,11 @@ class Daemon:
         with self.lock:
             if self.state != "idle":
                 return f"busy ({self.state})"
-            self.recorder.start()
+            try:
+                self.recorder.start()
+            except Exception as e:                  # not even the system default mic works
+                print(f"could not start recording: {e!r}", file=sys.stderr, flush=True)
+                return f"error: could not start recording: {e}"
             self.state = "recording"
         self._sound(SOUND_START)
         return "recording"
@@ -581,7 +635,7 @@ class Daemon:
             startup = (sound[0] if len(sound) else len(audio)) / SAMPLE_RATE
             if startup > 0.3:   # exact digital silence at the start = the mic was still waking up
                 print(f"  warning: the microphone delivered nothing for the first {startup:.1f}s"
-                      " (Bluetooth headset? choose another one: ./install.sh or --input-device)",
+                      " (Bluetooth headset? set a preferred mic: ./install.sh or --input-device)",
                       flush=True)
             if speech < MIN_SPEECH_SECONDS:
                 print(f"[{levels}] nothing heard", flush=True)
@@ -696,8 +750,8 @@ def main() -> int:
                    help="don't add a space after each dictation")
     g = sv.add_argument_group("misc")
     g.add_argument("--input-device", default=None,
-                   help="microphone: a PipeWire source name from `pactl list sources short` "
-                        "(or a sounddevice id/name). Default: the system default")
+                   help="preferred microphone: a PipeWire source name from `pactl list sources "
+                        "short`. Used while connected, otherwise the system default")
     g.add_argument("--sounds", action="store_true", help="play start/stop sounds")
 
     dl = sub.add_parser("download", help="download a Whisper model")
