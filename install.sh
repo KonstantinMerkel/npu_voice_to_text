@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Konstantin Merkel
-# Install or update npu-voice-to-text for the current user. Safe to re-run; re-run it to
-# change the microphone or the dictation key. Everything goes into your home
-# directory, no root needed:
+# Install or update npu-voice-to-text for the current user. Safe to re-run. Asks for
+# the settings: Recommended, or Custom - microphone, dictation key, typing speed,
+# languages, sounds.
+# Everything goes into your home directory, no root needed:
 #   ~/.local/bin/npu-voice-to-text                     launcher for the program in the venv
 #   ~/.local/share/npu-voice-to-text/{venv,lib,models} Python env, Intel NPU libs, Whisper models
 #   ~/.local/share/applications/<APP_ID>.desktop       the app's identity for the portals
 #   ~/.config/systemd/user/npu-voice-to-text.service   the daemon
 set -euo pipefail
+
+case "${1:-}" in
+    "")         ;;
+    -h|--help)  sed -n '4,6p' "$0" | cut -c3-; exit 0 ;;
+    *)          echo "unknown option: $1 (see ./install.sh --help)" >&2; exit 2 ;;
+esac
 
 # Intel NPU userspace driver + compiler. Must match the OpenVINO version in
 # pyproject.toml (see https://github.com/intel/linux-npu-driver/releases).
@@ -117,10 +124,10 @@ for model in "$MODEL" "$DETECT_MODEL"; do
 done
 
 # --------------------------------------------------------------------------- #
-step "Microphone"
-# created only once a choice is made, so an install aborted at the prompt still
-# counts as a first install next time
-fresh=$([[ -e "$OPTIONS" ]] && echo 0 || echo 1)
+# Settings: "Recommended" (no questions) or "Custom" (one question each, with the
+# current choices as defaults). Stored as `serve` options in $OPTIONS; options at
+# their default are left out, lines the installer doesn't manage are kept.
+step "Settings"
 create_options() {
     [[ -e "$OPTIONS" ]] && return
     mkdir -p "${OPTIONS%/*}"
@@ -129,80 +136,158 @@ create_options() {
 # After editing: systemctl --user restart npu-voice-to-text
 EOF
 }
-current_mic=$(sed -n 's/^--input-device[ =]//p' "$OPTIONS" 2>/dev/null | head -1 || true)
-mapfile -t MICS < <(python3 -I "$SRC/tools/microphones.py" 2>/dev/null || true)
-if (( ${#MICS[@]} == 0 )); then
+opt_get() { sed -n "s/^$1[ =]//p" "$OPTIONS" 2>/dev/null | head -1 || true; }   # opt_get --name
+opt_has() { [[ -e "$OPTIONS" ]] && grep -q -- "^$1\( \|=\|$\)" "$OPTIONS"; }    # opt_has --flag
+# opt_set --name [value]: replace the option's line; without a value, remove it.
+# A value of "" writes a bare flag.
+opt_set() {
     create_options
-    warn "could not list microphones (is pactl installed?) - dictation uses the system default"
-else
-    cat <<'EOF'
-    Dictation records from the preferred microphone while it is connected, and from
-    the system default (your desktop's sound settings) otherwise. Bluetooth headsets
-    switch into a low-quality headset mode when their mic opens; that takes ~1 s, so
-    the start of every dictation is lost. Prefer a wired or built-in mic.
-EOF
-    printf '    0) None - always the system default\n'
-    names=(); descs=(); current=""; default=""; first=""
-    for i in "${!MICS[@]}"; do
-        IFS=$'\t' read -r name desc bus is_default plugged <<<"${MICS[$i]}"
-        names+=("$name"); descs+=("$desc")
-        notes=""
-        [[ $is_default == 1 ]]        && notes+=", system default"
-        [[ $name == "$current_mic" ]] && notes+=", current"
-        [[ $bus == bluetooth ]]       && notes+=", Bluetooth: not recommended"
-        [[ $plugged == 0 ]]           && notes+=", nothing plugged in"
-        printf '    %d) %s%s\n' $((i + 1)) "$desc" "${notes:+  [${notes#, }]}"
-        usable=$([[ $bus != bluetooth && $plugged == 1 ]] && echo 1 || echo 0)
-        [[ $name == "$current_mic" ]] && current=$((i + 1))
-        [[ $usable == 1 && $is_default == 1 ]] && default=$((i + 1))
-        [[ $usable == 1 && -z $first ]] && first=$((i + 1))
-    done
-    if [[ -n $current_mic && -z $current ]]; then     # preferred mic, unplugged right now
-        names+=("$current_mic"); descs+=("$current_mic")
-        current=${#names[@]}
-        printf '    %d) %s  [current, not connected]\n' "$current" "$current_mic"
-    fi
-    # suggestion: the current choice; None if that was chosen before; on a first
-    # install a wired/built-in mic (the system default if it is one), so dictation
-    # doesn't follow the default to Bluetooth earbuds connected later
-    if [[ -n $current ]]; then suggested=$current
-    elif (( ! fresh )); then suggested=0
-    else suggested=${default:-${first:-0}}; fi
+    sed -i -- "/^$1\( \|=\|$\)/d" "$OPTIONS"
+    if (( $# > 1 )); then echo "$1${2:+ $2}" >> "$OPTIONS"; fi
+}
+title() { printf '\n    \033[1m%s\033[0m\n' "$1"; }
+pick() {     # pick suggested max: a number from 0 to max
+    local reply
     while :; do
-        pick=$(ask "Preferred microphone [$suggested]:")
-        pick=${pick:-$suggested}
+        reply=$(ask "Choose [$1]:")
+        reply=${reply:-$1}
         # 10#: a leading zero would make bash read the number as octal
-        [[ $pick =~ ^[0-9]+$ ]] && pick=$((10#$pick)) && (( pick <= ${#names[@]} )) && break
-        warn "enter a number between 0 and ${#names[@]}"
+        [[ $reply =~ ^[0-9]+$ ]] && (( 10#$reply <= $2 )) && { echo $((10#$reply)); return; }
+        warn "enter a number between 0 and $2" >&2
     done
-    create_options
-    sed -i '/^--input-device/d' "$OPTIONS"
-    if (( pick == 0 )); then
-        ok "no preferred microphone - always the system default"
-    else
-        echo "--input-device ${names[$((pick - 1))]}" >> "$OPTIONS"
-        ok "preferred: ${descs[$((pick - 1))]}, otherwise the system default (saved in $OPTIONS)"
+}
+yes_no() {   # yes_no "question" y|n: true for yes
+    local reply
+    reply=$(ask "$1 [$([[ $2 == y ]] && echo Y/n || echo y/N)]")
+    [[ ${reply:-$2} == [yY]* ]]
+}
+
+custom=0
+if [[ -t 0 ]]; then            # without a terminal (piped, scripted): Recommended
+    cat <<'EOF'
+    1) Recommended   a wired or built-in mic, normal typing speed, German and English
+    2) Custom        choose the mic, dictation key, typing speed, languages, sounds
+EOF
+    while :; do
+        reply=$(ask "Choose [1]:")
+        case ${reply:-1} in 1) break ;; 2) custom=1; break ;; esac
+        warn "enter 1 or 2"
+    done
+fi
+
+# ---- microphone. Recommended: a wired or built-in mic (the system default if it
+# is one), so dictation doesn't follow the default to Bluetooth earbuds
+current_mic=$(opt_get --input-device)
+mapfile -t MICS < <(python3 -I "$SRC/tools/microphones.py" 2>/dev/null || true)
+names=(); descs=(); lines=(); current=""; default=""; first=""
+for i in "${!MICS[@]}"; do
+    IFS=$'\t' read -r name desc bus is_default plugged <<<"${MICS[$i]}"
+    names+=("$name"); descs+=("$desc")
+    notes=""
+    [[ $is_default == 1 ]]        && notes+=", system default"
+    [[ $name == "$current_mic" ]] && notes+=", current"
+    [[ $bus == bluetooth ]]       && notes+=", Bluetooth: not recommended"
+    [[ $plugged == 0 ]]           && notes+=", nothing plugged in"
+    lines+=("$(printf '    %d) %s%s' $((i + 1)) "$desc" "${notes:+  [${notes#, }]}")")
+    usable=$([[ $bus != bluetooth && $plugged == 1 ]] && echo 1 || echo 0)
+    [[ $name == "$current_mic" ]] && current=$((i + 1))
+    [[ $usable == 1 && $is_default == 1 ]] && default=$((i + 1))
+    [[ $usable == 1 && -z $first ]] && first=$((i + 1))
+done
+if [[ -n $current_mic && -z $current ]]; then         # preferred mic, unplugged right now
+    names+=("$current_mic"); descs+=("$current_mic")
+    current=${#names[@]}
+    lines+=("$(printf '    %d) %s  [current, not connected]' "$current" "$current_mic")")
+fi
+mic=${default:-${first:-0}}
+mic_text="the system default"
+if (( ${#MICS[@]} == 0 )); then
+    warn "could not list microphones (is pactl installed?) - dictation uses the system default"
+    mic=0
+elif (( custom )); then
+    title "Microphone"
+    cat <<'EOF'
+    Used while connected, otherwise the system default. Avoid Bluetooth headsets:
+    their mic needs ~1 s to start, which cuts off the start of each dictation.
+    0) None - always the system default
+EOF
+    printf '%s\n' "${lines[@]}"
+    [[ -n $current ]] && mic=$current
+    [[ -z $current && -e $OPTIONS ]] && mic=0           # "None" was chosen before
+    mic=$(pick "$mic" "${#names[@]}")
+fi
+if (( mic == 0 )); then
+    opt_set --input-device
+else
+    opt_set --input-device "${names[$((mic - 1))]}"
+    mic_text="${descs[$((mic - 1))]}, otherwise the system default"
+fi
+
+# ---- dictation key: bound through GNOME's global shortcuts portal. GNOME asks for
+# it in a dialog on the first start and remembers it; to change it, the binding is
+# reset, and GNOME asks again.
+key=$(python3 -I "$SRC/tools/gnome-keys.py" get 2>/dev/null || true)
+if [[ -n $key ]] && (( custom )); then
+    title "Dictation key"
+    if yes_no "$key. Change it?" n; then
+        python3 -I "$SRC/tools/gnome-keys.py" reset
+        key=""
     fi
 fi
 
-# --------------------------------------------------------------------------- #
-step "Dictation key"
-cat <<'EOF'
-    Hold the key while speaking, the text appears on release.
-    Or tap it, speak hands-free, and tap again to finish.
-EOF
-# The key is bound through GNOME's global shortcuts portal: GNOME asks for it in a
-# dialog on the first start and remembers it. To change it, the binding is reset.
-key=$(python3 -I "$SRC/tools/gnome-keys.py" get 2>/dev/null || true)
-if [[ -n $key ]]; then
-    if [[ "$(ask "Dictation key: $key. Change it? [y/N]")" == [yY]* ]]; then
-        python3 -I "$SRC/tools/gnome-keys.py" reset
-        key=""
-        ok "GNOME will ask for the new key in a moment"
-    else
-        ok "keeping $key"
-    fi
+# ---- typing speed, languages, sounds, space
+delay=4; languages=de,en; fallback=en; sounds=n; space=y
+if (( custom )); then
+    delay=$(opt_get --key-delay); delay=${delay:-4}
+    languages=$(opt_get --languages); languages=${languages:-de,en}
+    fallback=$(opt_get --fallback-language); fallback=${fallback:-en}
+    sounds=$(opt_has --sounds && echo y || echo n)
+    space=$(opt_has --no-trailing-space && echo n || echo y)
+
+    title "Typing speed"
+    echo "    Some apps lose characters when they are typed too fast."
+    speeds=(2 4 10)
+    printf '    1) fast      ~0.5 s for 50 words\n    2) normal    ~1 s\n    3) careful   ~2.5 s\n'
+    speed=0
+    for i in "${!speeds[@]}"; do [[ ${speeds[$i]} == "$delay" ]] && speed=$((i + 1)); done
+    (( speed )) || printf '    0) keep the current %s ms per key\n' "$delay"
+    speed=$(pick "$speed" 3)
+    (( speed )) && delay=${speeds[$((speed - 1))]}
+
+    title "Languages"
+    echo "    Two-letter codes, e.g. de,en,fr. Speech in any other language is written in the fallback."
+    while :; do
+        reply=$(ask "Languages [$languages]:"); reply=${reply:-$languages}; reply=${reply// /}
+        [[ $reply =~ ^[a-z]{2,3}(,[a-z]{2,3})*$ ]] && break
+        warn "two-letter codes separated by commas, e.g. de,en"
+    done
+    languages=$reply
+    [[ ,$languages, == *,"$fallback",* ]] || fallback=${languages%%,*}
+    while :; do
+        reply=$(ask "Fallback [$fallback]:"); reply=${reply:-$fallback}
+        [[ $reply =~ ^[a-z]{2,3}$ ]] && break
+        warn "a two-letter code, e.g. en"
+    done
+    fallback=$reply
+
+    title "Other"
+    yes_no "Start/stop sounds?" "$sounds" && sounds=y || sounds=n
+    yes_no "Space after each dictation?" "$space" && space=y || space=n
+    echo
 fi
+if (( delay == 4 )); then opt_set --key-delay; else opt_set --key-delay "$delay"; fi
+if [[ $languages == de,en ]]; then opt_set --languages; else opt_set --languages "$languages"; fi
+if [[ $fallback == en ]]; then opt_set --fallback-language; else opt_set --fallback-language "$fallback"; fi
+if [[ $sounds == y ]]; then opt_set --sounds ""; else opt_set --sounds; fi
+if [[ $space == y ]]; then opt_set --no-trailing-space; else opt_set --no-trailing-space ""; fi
+
+case $delay in 2) speed_text=fast ;; 4) speed_text=normal ;; 10) speed_text=careful ;;
+               *) speed_text="$delay ms per key" ;; esac
+ok "microphone:     $mic_text"
+ok "dictation key:  ${key:-GNOME asks for it in a moment}"
+ok "typing speed:   $speed_text"
+ok "languages:      ${languages//,/, } (fallback $fallback)"
+ok "sounds:         $([[ $sounds == y ]] && echo on || echo off), space after each dictation: $([[ $space == y ]] && echo on || echo off)"
 
 # --------------------------------------------------------------------------- #
 step "Service"
@@ -270,5 +355,5 @@ cat <<EOF
     $howto
     Logs:            journalctl --user -u npu-voice-to-text -f
     Options:         $OPTIONS (see npu-voice-to-text serve --help), then: systemctl --user restart npu-voice-to-text
-    Key, mic:        re-run ./install.sh
+    Settings:        re-run ./install.sh and choose Custom
 EOF

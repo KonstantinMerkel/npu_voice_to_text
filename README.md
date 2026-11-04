@@ -47,14 +47,23 @@ The installer:
 3. fetches Intel's NPU driver and compiler (checksum-verified);
 4. checks that OpenVINO sees the NPU;
 5. downloads the two Whisper models (~1.1 GB);
-6. asks for the **preferred microphone** (or none). It's used while connected; otherwise, or with none, dictation records from the system default mic set in your desktop's sound settings. With none, dictation follows that default, also to Bluetooth earbuds when they connect, so the installer suggests a wired or built-in mic. Avoid Bluetooth headsets: opening their mic switches them into headset mode, which takes ~1 s, so the start of every dictation (or a whole single word) is lost. Empty jacks are marked.
+6. asks for the **settings**: Recommended or Custom (see below);
 7. starts the systemd user service and waits until it's ready. On the very first start, **GNOME shows two dialogs**:
    - **"Remote Desktop"**: allow keyboard access, otherwise nothing can be typed.
    - **"Add Keyboard Shortcuts"**: confirm F8 as the dictation key, or press the key you want.
 
    See [Privacy and security](#privacy-and-security) for what exactly they allow. The first start also compiles the model for the NPU, which takes a few minutes.
 
-Everything goes into your home directory; no root, no sudo. Re-run `./install.sh` at any time to update, or to change the microphone or key. It remembers your choices.
+Everything goes into your home directory; no root, no sudo. Re-run `./install.sh` at any time to update.
+
+**Settings.** *Recommended* takes a wired or built-in mic, normal typing speed, German and English, and keeps the dictation key. *Custom* asks for each setting, with your current choices as the defaults:
+- **Microphone** (or none). The preferred mic is used while connected; otherwise, or with none, dictation records from the system default mic set in your desktop's sound settings. With none, dictation follows that default, also to Bluetooth earbuds when they connect, so the installer suggests a wired or built-in mic. Avoid Bluetooth headsets: opening their mic switches them into headset mode, which takes ~1 s, so the start of every dictation (or a whole single word) is lost. Empty jacks are marked.
+- **Dictation key**: change it, and GNOME's dialog asks for the new one.
+- **Typing speed**: fast, normal or careful (2, 4 or 10 ms per key event). Choose careful if an app loses characters.
+- **Languages** you dictate in, and the fallback language.
+- **Sounds** at start and stop, and the **space after each dictation**.
+
+Both end with a summary. The settings are saved as options in `~/.config/npu-voice-to-text/options` (see below); options at their default are left out, and lines you added yourself are kept. Choosing Recommended on a later run resets the settings above to the recommended ones.
 
 
 ## Usage
@@ -93,7 +102,7 @@ Options go into `~/.config/npu-voice-to-text/options`, one per line (`#` comment
 | `--input-device` | set by `install.sh` | Preferred microphone: a PipeWire source name from `pactl list sources short`. Used while connected, otherwise the system default. |
 | `--sounds` | | Start/stop sounds. The first 0.4 s of each recording (the start sound) is dropped, so start speaking after it |
 
-**Key:** re-run `./install.sh`. The key is a GNOME global shortcut: to change it, answer "yes" to "Change it?", and GNOME's dialog asks for the new key. Any key or combination GNOME accepts works (F-keys, Pause, Insert, `Ctrl+F9`, …), but not a lone modifier like Right Ctrl. The key is swallowed: apps don't receive it while npu-voice-to-text runs.
+**Key:** re-run `./install.sh` and choose Custom. The key is a GNOME global shortcut: to change it, answer "yes" to "Change it?", and GNOME's dialog asks for the new key. Any key or combination GNOME accepts works (F-keys, Pause, Insert, `Ctrl+F9`, …), but not a lone modifier like Right Ctrl. The key is swallowed: apps don't receive it while npu-voice-to-text runs.
 
 
 ## How it works
@@ -127,12 +136,12 @@ key down/up ─▶ GNOME global shortcut (portal) ──────────
 | `NPU` missing from the installer's device list | Check `ls -l /dev/accel/accel0` and that NPU firmware is installed (`dmesg \| grep intel_vpu`). |
 | `Compilation failed … vclAllocatedExecutableCreate2` | The NPU compiler doesn't match OpenVINO. Upgrade `openvino-genai` in `pyproject.toml` and `NPU_DRIVER_*` in `install.sh` together, then re-run it. |
 | The key does nothing | `journalctl --user -u npu-voice-to-text -f` should say `dictation key: Press F8` after the start, and `key down` / `key up` when you press it. `no dictation key` means the GNOME dialog was declined: re-run `./install.sh`. On laptops, the F-keys are often media keys: use Fn or FnLock, or pick another key. |
-| Short words get lost, or the start of sentences is missing | The log says `warning: the microphone delivered nothing for the first …s`. Typically that's a Bluetooth headset switching modes. Set another preferred mic with `./install.sh`, or change the system default. |
+| Short words get lost, or the start of sentences is missing | The log says `warning: the microphone delivered nothing for the first …s`. Typically that's a Bluetooth headset switching modes. Set another preferred mic by re-running `./install.sh` (Custom), or change the system default. |
 | "Nothing heard" although you spoke | Check the log line `[… speech, peak …]`. A peak below ~0.005 means the mic is too quiet or muted (a laptop's built-in mic with the lid closed, for example). Pick another mic or raise its input volume. |
 | Nothing typed / wrong window | The log should not say `no keyboard access`. If it does (dialog declined or revoked), re-run `./install.sh` and allow it. Text goes to the window focused at **release**. |
 | The installer says `no keyboard access` | The GNOME dialog was declined or left open for 5 min. Re-run `./install.sh`. |
 | Wrong characters | The log prints `keymap <layout>`. Set `--layout` if that's wrong. Check that Caps Lock is off. Characters your layout has no key for are replaced (`ä` → `ae`) or, like emoji, left out (`no key on this layout, left out: …` in the log). |
-| Characters missing | Raise `--key-delay` to 8–12. |
+| Characters missing | Re-run `./install.sh`, change the settings, typing speed "careful" (or `--key-delay` 8–12). |
 | English comes out as German | Don't use `--language`. See also Known issues. |
 | "Untertitel der Amara.org-Community" etc. | A Whisper hallucination on silence. Add it to `HALLUCINATIONS` in `src/npu_voice_to_text/transcriber.py` and re-run `./install.sh`. |
 
