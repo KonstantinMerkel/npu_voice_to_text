@@ -4,6 +4,7 @@ import os
 import stat
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -257,3 +258,86 @@ def test_probe_is_not_a_command(make, tmp_path, capsys):
     assert request("status", path=sock) == "idle"
     out = capsys.readouterr()
     assert "command:  " not in out.out and "request failed" not in out.err
+
+
+@pytest.fixture
+def tap(monkeypatch):
+    """Make every key press count as a tap (True) or as a hold (False)."""
+    def set_(is_tap):
+        monkeypatch.setattr("npu_voice_to_text.daemon.TAP_SECONDS", 1e9 if is_tap else 0.0)
+    return set_
+
+
+def test_key_held(make, tap):
+    tap(False)
+    d, _, _, kb = make()
+    d.key_down()
+    assert d.status() == "recording"
+    d.key_up()
+    wait_until(lambda: d.status() == "idle")
+    assert kb.typed == "hallo "
+
+
+def test_key_tapped_then_pressed_again(make, tap):
+    tap(True)
+    d, _, _, kb = make()
+    d.key_down(), d.key_up()
+    assert d.status() == "recording"                # a tap keeps recording
+    d.key_down()                                    # the next press stops it ...
+    assert d.status() != "recording"
+    d.key_up()                                      # ... and its release changes nothing
+    wait_until(lambda: d.status() == "idle")
+    assert kb.typed == "hallo "
+
+
+def test_tap_then_next_dictation_held(make, tap):
+    tap(True)
+    d, _, _, kb = make(texts=["eins", "zwei"])
+    d.key_down(), d.key_up(), d.key_down(), d.key_up()      # tap, tap
+    tap(False)
+    d.key_down()
+    assert d.status().startswith("recording")
+    d.key_up()
+    wait_until(lambda: d.status() == "idle")
+    assert kb.typed == "eins zwei "
+
+
+def test_time_limit_after_a_tap(make, tap):
+    """The limit stopped a tapped recording: the user's press meant "stop", so it
+    doesn't start a new one - the press after it does."""
+    tap(True)
+    d, _, _, _ = make(texts=["eins", "zwei"])
+    d.key_down(), d.key_up()
+    d._limit_reached()
+    d.key_down(), d.key_up()
+    assert d.status() != "recording"
+    d.key_down()
+    assert d.status().startswith("recording")
+
+
+def test_time_limit_while_held(make, tap):
+    """Held past the limit: the release clears it, the next press records again."""
+    tap(False)
+    d, _, _, _ = make(texts=["eins", "zwei"])
+    d.key_down()
+    d._limit_reached()
+    d.key_up()
+    d.key_down()
+    assert d.status().startswith("recording")
+
+
+def test_command_while_key_down_is_not_stopped_by_the_release(make, tap):
+    """A CLI command while the key is down takes over: the release leaves it alone."""
+    tap(False)
+    d, _, _, _ = make()
+    d.key_down()
+    d.handle("toggle")                              # stops the key's recording ...
+    d.handle("toggle")                              # ... and starts its own
+    d.key_up()
+    assert d.status().startswith("recording")
+
+
+def test_status_reports_a_declined_key(make):
+    d, _, _, _ = make()
+    d.shortcut = SimpleNamespace(denied=True)
+    assert d.status() == "no dictation key"

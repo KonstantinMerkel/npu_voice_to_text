@@ -18,4 +18,4 @@ huggingface_hub only by `download`.
 See docs/ARCHITECTURE.md for how the pieces fit together.
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

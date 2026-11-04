@@ -2,7 +2,7 @@
 
 Hold-to-talk dictation for GNOME on Wayland. The speech recognition runs locally on the **Intel NPU** ("AI Boost") of Core Ultra laptops.
 
-Hold a key (F8 by default), speak German or English, release. About two seconds later the text is typed into whatever window has focus.
+Hold a key (F8 by default), speak German or English, release. About two seconds later the text is typed into whatever window has focus. For longer dictations, tap the key instead, speak hands-free, and tap it again.
 
 - **Offline.** Whisper large-v3-turbo runs on the NPU via [OpenVINO GenAI](https://github.com/openvinotoolkit/openvino.genai). Nothing leaves the machine, and the CPU and GPU stay free.
 - **Works on Wayland, the sanctioned way.** Text is typed through GNOME's Remote Desktop portal, with keyboard access you allow once in a GNOME dialog. No ydotool, no clipboard.
@@ -18,15 +18,15 @@ Hold a key (F8 by default), speak German or English, release. About two seconds 
 |---|---|
 | Intel Core Ultra CPU with NPU | `/dev/accel/accel0` must exist (kernel driver `intel_vpu`, in mainline since 6.3) and be read/writable for you. |
 | NPU firmware | From your distro (`intel-npu-firmware` on Fedora, `linux-firmware` elsewhere). |
-| GNOME on Wayland | Typing uses the Remote Desktop portal (`xdg-desktop-portal-gnome`, installed with GNOME). The layout is read from GNOME settings. |
+| GNOME 48 or newer, on Wayland | The dictation key uses the global shortcuts portal (new in GNOME 48), typing the Remote Desktop portal (`xdg-desktop-portal-gnome`, installed with GNOME). The layout is read from GNOME settings. |
 | Python 3.10+ | |
-| System libraries | Level Zero loader, oneTBB, PortAudio, libxkbcommon, `binutils` (for `ar`) |
+| System libraries | Level Zero loader, oneTBB, PortAudio, libxkbcommon, PyGObject, `binutils` (for `ar`) |
 
 ```bash
 # Fedora
-sudo dnf install oneapi-level-zero tbb portaudio libxkbcommon binutils
+sudo dnf install oneapi-level-zero tbb portaudio libxkbcommon python3-gobject binutils
 # Ubuntu / Debian
-sudo apt install libze1 libtbb12 libportaudio2 libxkbcommon0 binutils
+sudo apt install libze1 libtbb12 libportaudio2 libxkbcommon0 python3-gi binutils
 ```
 
 You don't need distro OpenVINO or NPU-compiler packages. `install.sh` fetches the exact versions that work together. Fedora's `intel-npu-compiler`, for example, is too old for current OpenVINO, and it pulls in about 8 GB of dependencies.
@@ -48,21 +48,21 @@ The installer:
 4. checks that OpenVINO sees the NPU;
 5. downloads the two Whisper models (~1.1 GB);
 6. asks for the **preferred microphone** (or none). It's used while connected; otherwise, or with none, dictation records from the system default mic set in your desktop's sound settings. With none, dictation follows that default, also to Bluetooth earbuds when they connect, so the installer suggests a wired or built-in mic. Avoid Bluetooth headsets: opening their mic switches them into headset mode, which takes ~1 s, so the start of every dictation (or a whole single word) is lost. Empty jacks are marked.
-7. starts the systemd user service and waits until it's ready. On the very first start, **GNOME asks whether to allow keyboard access** ("Remote Desktop" dialog). Allow it, otherwise nothing can be typed; see [Privacy and security](#privacy-and-security) for what exactly that allows. The first start also compiles the model for the NPU, which takes a few minutes.
-8. asks for the **mode** and the **key**:
-   - **hold-to-talk** (default): hold the key while speaking. Needs a small root service that reads the keyboards (sudo, see [Privacy and security](#privacy-and-security)).
-   - **toggle**: press the key to start, press it again to stop. A plain GNOME shortcut, no root.
-9. sets up the GNOME shortcut. In hold-to-talk mode it binds the key to a do-nothing command, so apps don't also receive it (F8 in a terminal would print `^[[19~`).
+7. starts the systemd user service and waits until it's ready. On the very first start, **GNOME shows two dialogs**:
+   - **"Remote Desktop"**: allow keyboard access, otherwise nothing can be typed.
+   - **"Add Keyboard Shortcuts"**: confirm F8 as the dictation key, or press the key you want.
 
-Everything except the key watcher goes into your home directory. Re-run `./install.sh` at any time to update, or to change the microphone, key or mode. It remembers your choices.
+   See [Privacy and security](#privacy-and-security) for what exactly they allow. The first start also compiles the model for the NPU, which takes a few minutes.
+
+Everything goes into your home directory; no root, no sudo. Re-run `./install.sh` at any time to update, or to change the microphone or key. It remembers your choices.
 
 
 ## Usage
 
 | Action | How |
 |---|---|
-| Dictate (hold-to-talk) | Hold your key, speak, release |
-| Dictate (toggle) | Press your key, speak, press it again |
+| Dictate | Hold your key, speak, release |
+| Dictate hands-free | Tap your key (shorter than 0.4 s), speak, tap it again |
 | Cancel a recording | `npu-voice-to-text cancel` (bind it to a shortcut if you like) |
 | Status | `npu-voice-to-text status` → `idle`, `recording`, `transcribing N` or both |
 | Logs | `journalctl --user -u npu-voice-to-text -f` (transcripts, language, timings) |
@@ -93,13 +93,13 @@ Options go into `~/.config/npu-voice-to-text/options`, one per line (`#` comment
 | `--input-device` | set by `install.sh` | Preferred microphone: a PipeWire source name from `pactl list sources short`. Used while connected, otherwise the system default. |
 | `--sounds` | | Start/stop sounds. The first 0.4 s of each recording (the start sound) is dropped, so start speaking after it |
 
-**Key and mode:** re-run `./install.sh`. Keys: F1–F24, PAUSE, SCROLLLOCK, INSERT, MENU, and, in hold-to-talk mode only, RIGHTCTRL and RIGHTMETA. A lone modifier produces no input in apps, but it can't be a GNOME shortcut on its own. The hold key is stored in `/etc/npu-voice-to-text/keywatch-<uid>.env` (`KEY=F8`). A numeric evdev code works there too; restart `npu-voice-to-text-keywatch@<uid>` after editing it.
+**Key:** re-run `./install.sh`. The key is a GNOME global shortcut: to change it, answer "yes" to "Change it?", and GNOME's dialog asks for the new key. Any key or combination GNOME accepts works (F-keys, Pause, Insert, `Ctrl+F9`, …), but not a lone modifier like Right Ctrl. The key is swallowed: apps don't receive it while npu-voice-to-text runs.
 
 
 ## How it works
 
 ```
-key down/up ─▶ npu-voice-to-text-keywatch (root) ─▶ socket ─▶ npu-voice-to-text (user daemon)
+key down/up ─▶ GNOME global shortcut (portal) ──────────────▶ npu-voice-to-text (user daemon)
                                                           │ record mic while held
                                                           │ on release:
                                                           │   whisper-small on CPU → language
@@ -114,9 +114,10 @@ key down/up ─▶ npu-voice-to-text-keywatch (root) ─▶ socket ─▶ npu-vo
 ## Privacy and security
 
 - Audio is processed locally and never stored. Transcripts appear in your user journal (`journalctl --user -u npu-voice-to-text`).
-- **The key watcher runs as root**, because reading `/dev/input` needs root or the `input` group. Membership in `input` would let every program you run read all your keystrokes. The watcher is ~100 lines of standard-library Python. It forwards only press/release of one key, and the systemd unit drops every capability except the one needed to reach your socket.
+- **Nothing runs as root.** npu-voice-to-text never reads your keyboard: GNOME tells it when the dictation key goes down and up (the global shortcuts portal), and nothing else. The binding is stored by GNOME in dconf (`/org/gnome/settings-daemon/global-shortcuts/io.github.KonstantinMerkel.NpuVoiceToText/`); `./uninstall.sh` removes it.
+- Both portals identify npu-voice-to-text by the app ID `io.github.KonstantinMerkel.NpuVoiceToText`, from a hidden desktop file in `~/.local/share/applications`. That's also the name GNOME's dialogs show.
 - The daemon socket is `0600`, so only you (and root) can start a recording.
-- **Keyboard access.** In GNOME's dialog you allow npu-voice-to-text to send key presses to the window that has focus, the way a second keyboard would. Only the keyboard is requested: no mouse, no screen sharing. GNOME stores the permission (table `remote-desktop` of its permission store) under a secret restore token, which npu-voice-to-text keeps in `~/.local/state/npu-voice-to-text/remote-desktop-token` (mode `0600`). With the token, later dictations need no dialog. Programs not sandboxed by Flatpak run as you and could read that file, the same trust level as anything else in your home directory. `./uninstall.sh` revokes the permission; to revoke it by hand: `gdbus call --session --dest org.freedesktop.impl.portal.PermissionStore --object-path /org/freedesktop/impl/portal/PermissionStore --method org.freedesktop.impl.portal.PermissionStore.Delete remote-desktop "$(cat ~/.local/state/npu-voice-to-text/remote-desktop-token)"`.
+- **Keyboard access.** In GNOME's dialog you allow npu-voice-to-text to send key presses to the window that has focus, the way a second keyboard would. Only the keyboard is requested: no mouse, no screen sharing. GNOME stores the permission (table `remote-desktop` of its permission store) under a secret restore token, which npu-voice-to-text keeps in `~/.local/state/npu-voice-to-text/keyboard-access.token` (mode `0600`). With the token, later dictations need no dialog. Programs not sandboxed by Flatpak run as you and could read that file, the same trust level as anything else in your home directory. `./uninstall.sh` revokes the permission; to revoke it by hand: `gdbus call --session --dest org.freedesktop.impl.portal.PermissionStore --object-path /org/freedesktop/impl/portal/PermissionStore --method org.freedesktop.impl.portal.PermissionStore.Delete remote-desktop "$(cat ~/.local/state/npu-voice-to-text/keyboard-access.token)"`.
 
 
 ## Troubleshooting
@@ -125,7 +126,7 @@ key down/up ─▶ npu-voice-to-text-keywatch (root) ─▶ socket ─▶ npu-vo
 |---|---|
 | `NPU` missing from the installer's device list | Check `ls -l /dev/accel/accel0` and that NPU firmware is installed (`dmesg \| grep intel_vpu`). |
 | `Compilation failed … vclAllocatedExecutableCreate2` | The NPU compiler doesn't match OpenVINO. Upgrade `openvino-genai` in `pyproject.toml` and `NPU_DRIVER_*` in `install.sh` together, then re-run it. |
-| Holding the key does nothing | `journalctl -u npu-voice-to-text-keywatch@$(id -u)` should list your keyboards, and `journalctl --user -u npu-voice-to-text -f` should show `command: press`. On laptops, the F-keys are often media keys: use Fn or FnLock, or pick another key. |
+| The key does nothing | `journalctl --user -u npu-voice-to-text -f` should say `dictation key: Press F8` after the start, and `key down` / `key up` when you press it. `no dictation key` means the GNOME dialog was declined: re-run `./install.sh`. On laptops, the F-keys are often media keys: use Fn or FnLock, or pick another key. |
 | Short words get lost, or the start of sentences is missing | The log says `warning: the microphone delivered nothing for the first …s`. Typically that's a Bluetooth headset switching modes. Set another preferred mic with `./install.sh`, or change the system default. |
 | "Nothing heard" although you spoke | Check the log line `[… speech, peak …]`. A peak below ~0.005 means the mic is too quiet or muted (a laptop's built-in mic with the lid closed, for example). Pick another mic or raise its input volume. |
 | Nothing typed / wrong window | The log should not say `no keyboard access`. If it does (dialog declined or revoked), re-run `./install.sh` and allow it. Text goes to the window focused at **release**. |
@@ -160,7 +161,7 @@ After a change, re-run `./install.sh`. It builds the package from a fresh copy o
 ## Uninstall
 
 ```bash
-./uninstall.sh          # revokes the keyboard access; keeps venv, NPU libs and models
+./uninstall.sh          # revokes the keyboard access, forgets the key; keeps venv, NPU libs and models
 ./uninstall.sh --all    # removes everything
 ```
 

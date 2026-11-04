@@ -4,8 +4,8 @@
 
 Commands:
   serve               run the daemon (normally via the systemd user service)
-  press / release     start / stop recording (sent by npu-voice-to-text-keywatch)
-  toggle              start or stop recording (for a normal GNOME shortcut)
+  press / release     start / stop recording (the dictation key does this itself)
+  toggle              start or stop recording
   cancel              stop recording and throw the audio away
   status              print the daemon state
   download            fetch a Whisper model from Hugging Face

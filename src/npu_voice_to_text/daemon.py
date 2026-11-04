@@ -18,6 +18,7 @@ from .audio import (MAX_SECONDS, MIN_SPEECH_SECONDS, NOISE_FLOOR_MIN, SAMPLE_RAT
                     silent_start, speech_stats)
 from .client import daemon_running
 from .keyboard import Keyboard
+from .portal import GlobalShortcut
 from .transcriber import Transcriber, lang_code
 
 SOUND_START = "/usr/share/sounds/freedesktop/stereo/device-added.oga"
@@ -25,6 +26,7 @@ SOUND_STOP = "/usr/share/sounds/freedesktop/stereo/device-removed.oga"
 SOUND_START_SKIP = 0.4     # seconds of audio dropped after the start sound (0.22 s + latency)
 SILENT_START_WARNING = 0.3  # seconds of digital silence at the start worth a warning
 CLIENT_TIMEOUT = 2.0        # seconds a client may take to send its command
+TAP_SECONDS = 0.4           # a shorter key press is a tap: keep recording until the next press
 EXIT_NO_KEYBOARD = 3        # keyboard access declined: the unit doesn't restart on it
 
 
@@ -33,10 +35,11 @@ class Daemon:
     previous one is still being transcribed.
 
     release queues the recording; one worker thread transcribes and types the
-    recordings in order. Text is only typed while no recording runs - a held
-    RIGHTCTRL/RIGHTMETA dictation key would otherwise turn the typed characters
-    into shortcuts - so typing pauses (between whole characters) when one starts.
-    Socket commands are handled one at a time in the main thread.
+    recordings in order. Text is only typed while no recording runs - never into
+    the window while you are dictating, with the dictation key held down - so
+    typing pauses (between whole characters) when one starts.
+    Socket commands (main thread) and the dictation key (portal thread) are
+    handled one at a time, under `commands`.
 
     transcriber: callable (audio, speech_seconds) -> (text, language, seconds)
     recorder:    start(skip) / stop() -> audio; its `on_limit` is set here
@@ -47,6 +50,10 @@ class Daemon:
                  trailing_space: bool = True):
         self.transcriber, self.recorder, self.keyboard = transcriber, recorder, keyboard
         self.sounds, self.trailing_space = sounds, trailing_space
+        self._key_down_at = 0.0
+        self._ignore_key_up = False   # this press stopped a recording; its release is no stop
+        self.commands = threading.Lock()  # one socket command or key event at a time
+        self.shortcut = None              # the GlobalShortcut, for status()
         self.lock = threading.Lock()
         self.mic_free = threading.Condition(self.lock)    # notified when a recording ends
         self.recording = False
@@ -63,7 +70,8 @@ class Daemon:
         """The real daemon: models on the NPU/CPU, the microphone, the portal."""
         t0 = time.monotonic()
         keyboard = Keyboard(args.layout, args.key_delay)
-        # first, so the GNOME dialog shows up right away on the first start (install)
+        # first, so the GNOME dialogs show up right away on the first start (install),
+        # one after the other: keyboard access, then the dictation key
         print("checking keyboard access (the first start asks for it in a GNOME dialog)",
               flush=True)
         try:
@@ -72,6 +80,10 @@ class Daemon:
             print(f"no keyboard access: {e}\n  re-run ./install.sh to be asked again",
                   file=sys.stderr, flush=True)
             sys.exit(EXIT_NO_KEYBOARD)              # systemd doesn't restart on this one
+        # bound in the background while the models load: the first time, GNOME asks
+        # to confirm the key. Presses before the daemon is ready are ignored.
+        shortcut = GlobalShortcut(lambda: None, lambda: None)
+        shortcut.start()
         languages = [lang_code(x) for x in args.languages.split(",") if x.strip()]
         transcriber = Transcriber.load(
             args.model, args.device, args.detect_model, args.detect_device, languages,
@@ -79,6 +91,8 @@ class Daemon:
         recorder = Recorder(args.input_device)
         daemon = cls(transcriber, recorder, keyboard, sounds=args.sounds,
                      trailing_space=args.trailing_space)
+        shortcut.on_press, shortcut.on_release = daemon.key_down, daemon.key_up
+        daemon.shortcut = shortcut
         lang = (f"forced {args.language}" if args.language else
                 f"auto within {','.join(languages)}, fallback {args.fallback_language}")
         print(f"ready after {time.monotonic() - t0:.1f}s (language: {lang})", flush=True)
@@ -87,7 +101,8 @@ class Daemon:
     # ---- commands --------------------------------------------------------- #
     def status(self) -> str:
         parts = (["recording"] if self.recording else []) + \
-                ([f"transcribing {self.pending}"] if self.pending else [])
+                ([f"transcribing {self.pending}"] if self.pending else []) + \
+                (["no dictation key"] if self.shortcut and self.shortcut.denied else [])
         return ", ".join(parts) or "idle"
 
     def press(self) -> str:
@@ -154,11 +169,40 @@ class Daemon:
             self.mic_free.notify_all()
         return "cancelled"
 
+    # ---- the dictation key (GlobalShortcuts portal) ------------------------ #
+    # Hold the key: recording while held, stopped on release. Tap it (shorter than
+    # TAP_SECONDS): recording continues, and the next press stops it.
+    # A press that stops a recording (after a tap, or after the time limit stopped
+    # it) has done its job on the way down: its release is ignored.
+    def key_down(self):
+        with self.commands:
+            print(f"key down ({self.status()})", flush=True)
+            self._key_down_at = time.monotonic()
+            self._ignore_key_up = self.recording or self.limit_stopped
+            self.toggle()
+
+    def key_up(self):
+        with self.commands:
+            held = time.monotonic() - self._key_down_at
+            print(f"key up after {held:.2f}s ({self.status()})", flush=True)
+            if self._ignore_key_up:
+                return
+            if held < TAP_SECONDS:
+                if self.recording:
+                    print("  short press: recording until the next press", flush=True)
+                return
+            self.release()      # also clears limit_stopped if the limit stopped it while held
+
     def handle(self, cmd: str) -> str:
-        print(f"command: {cmd} ({self.status()})", flush=True)
         actions = {"press": self.press, "release": self.release, "toggle": self.toggle,
                    "cancel": self.cancel, "status": self.status}
-        return actions[cmd]() if cmd in actions else f"error: unknown command {cmd!r}"
+        with self.commands:
+            print(f"command: {cmd} ({self.status()})", flush=True)
+            if cmd in actions and cmd != "status":
+                # a command while the key is down takes over: the key's release
+                # must not stop what the command started
+                self._ignore_key_up = True
+            return actions[cmd]() if cmd in actions else f"error: unknown command {cmd!r}"
 
     # ---- transcription ---------------------------------------------------- #
     def _worker(self):

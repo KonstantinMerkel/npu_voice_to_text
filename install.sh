@@ -2,13 +2,12 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Konstantin Merkel
 # Install or update npu-voice-to-text for the current user. Safe to re-run; re-run it to
-# change the dictation key or the mode. Installed without root:
+# change the microphone or the dictation key. Everything goes into your home
+# directory, no root needed:
 #   ~/.local/bin/npu-voice-to-text                     launcher for the program in the venv
 #   ~/.local/share/npu-voice-to-text/{venv,lib,models} Python env, Intel NPU libs, Whisper models
+#   ~/.local/share/applications/<APP_ID>.desktop       the app's identity for the portals
 #   ~/.config/systemd/user/npu-voice-to-text.service   the daemon
-# Only for hold-to-talk mode (asks first, uses sudo):
-#   /usr/local/bin/npu-voice-to-text-keywatch, /etc/systemd/system/npu-voice-to-text-keywatch@.service,
-#   /etc/npu-voice-to-text/keywatch-<uid>.env
 set -euo pipefail
 
 # Intel NPU userspace driver + compiler. Must match the OpenVINO version in
@@ -25,9 +24,9 @@ DATA=${XDG_DATA_HOME:-$HOME/.local/share}/npu-voice-to-text
 BIN=$HOME/.local/bin
 UNITS=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
 OPTIONS=${XDG_CONFIG_HOME:-$HOME/.config}/npu-voice-to-text/options
-TOKEN=${XDG_STATE_HOME:-$HOME/.local/state}/npu-voice-to-text/remote-desktop-token
-KEYWATCH_UNIT=/etc/systemd/system/npu-voice-to-text-keywatch@.service
-KEYWATCH_ENV=/etc/npu-voice-to-text/keywatch-$(id -u).env
+TOKEN=${XDG_STATE_HOME:-$HOME/.local/state}/npu-voice-to-text/keyboard-access.token
+APP_ID=io.github.KonstantinMerkel.NpuVoiceToText
+DESKTOP=${XDG_DATA_HOME:-$HOME/.local/share}/applications/$APP_ID.desktop
 
 step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 ok()   { printf '    \033[32m✓\033[0m %s\n' "$*"; }
@@ -42,15 +41,19 @@ step "Checking requirements"
 [[ -e /dev/accel/accel0 ]] || die "no NPU found (/dev/accel/accel0). Needs an Intel Core Ultra CPU and the intel_vpu kernel driver."
 [[ -r /dev/accel/accel0 && -w /dev/accel/accel0 ]] || die "/dev/accel/accel0 is not read/writable for you (normally group 'render')."
 missing=()
-for cmd in python3 curl ar tar gsettings gdbus; do
+for cmd in python3 curl ar tar gsettings gdbus gnome-shell; do
     command -v "$cmd" >/dev/null || missing+=("$cmd")
 done
 has_lib libze_loader.so.1    || missing+=("Level Zero loader (Fedora: oneapi-level-zero, Ubuntu: libze1)")
 has_lib libtbb.so.12         || missing+=("oneTBB (Fedora: tbb, Ubuntu: libtbb12)")
 has_lib libportaudio.so.2    || missing+=("PortAudio (Fedora: portaudio, Ubuntu: libportaudio2)")
 has_lib libxkbcommon.so.0    || missing+=("libxkbcommon")
+python3 -I -c 'from gi.repository import Gio' 2>/dev/null || missing+=("PyGObject (Fedora: python3-gobject, Ubuntu: python3-gi)")
 (( ${#missing[@]} == 0 )) || die "missing: ${missing[*]}"
-ok "NPU, tools and libraries found"
+# GNOME 48 brought the global shortcuts portal (the dictation key)
+gnome=$(gnome-shell --version | grep -o '[0-9]\+' | head -1 || true)
+(( ${gnome:-0} >= 48 )) || die "needs GNOME 48 or newer (found: $(gnome-shell --version))"
+ok "NPU, GNOME $gnome, tools and libraries found"
 
 # --------------------------------------------------------------------------- #
 step "Python environment"
@@ -183,18 +186,48 @@ EOF
 fi
 
 # --------------------------------------------------------------------------- #
+step "Dictation key"
+cat <<'EOF'
+    Hold the key while speaking, the text appears on release.
+    Or tap it, speak hands-free, and tap again to finish.
+EOF
+# The key is bound through GNOME's global shortcuts portal: GNOME asks for it in a
+# dialog on the first start and remembers it. To change it, the binding is reset.
+key=$(python3 -I "$SRC/tools/gnome-keys.py" get 2>/dev/null || true)
+if [[ -n $key ]]; then
+    if [[ "$(ask "Dictation key: $key. Change it? [y/N]")" == [yY]* ]]; then
+        python3 -I "$SRC/tools/gnome-keys.py" reset
+        key=""
+        ok "GNOME will ask for the new key in a moment"
+    else
+        ok "keeping $key"
+    fi
+fi
+
+# --------------------------------------------------------------------------- #
 step "Service"
+# before the start: the portals need it. Exec gets the full path - GLib ignores a
+# desktop file whose program isn't on PATH, and ~/.local/bin may not be on it yet
+mkdir -p "${DESKTOP%/*}"
+sed "s|^Exec=npu-voice-to-text |Exec=\"$BIN/npu-voice-to-text\" |" \
+    "$SRC/data/$APP_ID.desktop" > "$DESKTOP"
 install -Dm644 "$SRC/systemd/npu-voice-to-text.service" "$UNITS/npu-voice-to-text.service"
 systemctl --user daemon-reload
 systemctl --user enable --quiet npu-voice-to-text
 if [[ ! -s $TOKEN ]]; then
     cat <<'EOF'
-    To type the dictated text into other windows, npu-voice-to-text asks GNOME for
-    keyboard access (the "Remote Desktop" portal). A GNOME dialog appears in a moment:
-    please allow it. Only the keyboard is requested - no mouse, no screen sharing.
-    GNOME remembers the answer; ./uninstall.sh revokes it again.
+    GNOME dialog: "Remote Desktop" - please allow it.
+      npu-voice-to-text types the dictated text into other windows, so it asks for
+      keyboard access. Only the keyboard: no mouse, no screen sharing.
 EOF
 fi
+if [[ -z $key ]]; then
+    cat <<'EOF'
+    GNOME dialog: "Add Keyboard Shortcuts" - confirm F8 or press the key you want.
+      Avoid keys apps need; on laptops, F-keys may need Fn or FnLock.
+EOF
+fi
+[[ -s $TOKEN && -n $key ]] || echo "    GNOME remembers both answers; ./uninstall.sh revokes them."
 systemctl --user restart npu-voice-to-text
 restarts=$(systemctl --user show -p NRestarts --value npu-voice-to-text)
 printf '    starting (the first start compiles the model for the NPU, up to a few minutes) '
@@ -217,63 +250,19 @@ for (( i = 0; ; i++ )); do
 done
 echo; ok "npu-voice-to-text is running"
 
-# --------------------------------------------------------------------------- #
-step "Dictation key and mode"
-declare -A KEYCODE KEYACCEL
-while read -r name code accel; do KEYCODE[$name]=$code; KEYACCEL[$name]=$accel; done \
-    < <(python3 -I "$SRC/npu-voice-to-text-keywatch.py" --list-keys)
-cat <<'EOF'
-    hold-to-talk  hold the key while speaking, text appears on release.
-                  Needs a small root service that reads the keyboards and forwards
-                  only this key's press/release (sudo; see README, Security).
-    toggle        press the key to start, press it again to stop.
-                  A plain GNOME shortcut, no root needed.
-EOF
-[[ "$(ask "Use hold-to-talk? [Y/n]")" == [nN]* ]] && mode=toggle || mode=hold
-
-current=$(sed -n 's/^KEY=//p' "$KEYWATCH_ENV" 2>/dev/null || true)
-if [[ -z $current ]]; then          # toggle mode: the key is in the GNOME shortcut
-    bound=$(python3 -I "$SRC/tools/gnome-shortcut.py" get 2>/dev/null || true)
-    for k in "${!KEYACCEL[@]}"; do
-        [[ -n $bound && ${KEYACCEL[$k]} == "$bound" ]] && current=$k
-    done
-fi
-echo "    keys: F1-F12, PAUSE, SCROLLLOCK, INSERT, MENU$([[ $mode == hold ]] && echo ", RIGHTCTRL, RIGHTMETA")"
-echo "          (F13-F24 also work, if your keyboard or remapping tool has them)"
-while :; do
-    key=$(ask "Dictation key [${current:-F8}]:")
-    key=${key:-${current:-F8}}; key=${key^^}
-    if [[ -z "${KEYCODE[$key]:-}" ]]; then warn "unknown key '$key'"
-    elif [[ $mode == toggle && "${KEYACCEL[$key]}" == - ]]; then warn "$key alone can't be a GNOME shortcut - pick another key"
-    else break; fi
+# the key dialog may still be open: wait for GNOME to record the binding
+printf '    waiting for the dictation key '
+for (( i = 0; ; i++ )); do
+    key=$(python3 -I "$SRC/tools/gnome-keys.py" get 2>/dev/null || true)
+    [[ -n $key ]] && break
+    [[ $("$BIN/npu-voice-to-text" status 2>/dev/null) == *"no dictation key"* ]] &&
+        { echo; die "no dictation key - re-run ./install.sh and confirm a key in the GNOME dialog"; }
+    (( i < 600 )) || { echo; die "no key confirmed after 10 min - re-run ./install.sh"; }
+    (( i % 5 )) || printf .
+    sleep 1
 done
-accel=${KEYACCEL[$key]}
-
-if [[ $mode == hold ]]; then
-    echo "    installing the key watcher (sudo):"
-    sudo install -Dm755 -o root -g root "$SRC/npu-voice-to-text-keywatch.py" /usr/local/bin/npu-voice-to-text-keywatch
-    sudo install -Dm644 -o root -g root "$SRC/systemd/npu-voice-to-text-keywatch@.service" "$KEYWATCH_UNIT"
-    echo "KEY=$key" | sudo install -Dm644 -o root -g root /dev/stdin "$KEYWATCH_ENV"
-    sudo systemctl daemon-reload
-    sudo systemctl enable --quiet "npu-voice-to-text-keywatch@$(id -u)"
-    sudo systemctl restart "npu-voice-to-text-keywatch@$(id -u)"
-    ok "key watcher running for $key"
-    # the watcher doesn't grab the key: let GNOME swallow it so apps don't receive it
-    if [[ $accel != - ]]; then
-        python3 -I "$SRC/tools/gnome-shortcut.py" set "$accel" true \
-            && ok "GNOME swallows $key (shortcut 'npu-voice-to-text' -> true)" \
-            || warn "apps will also receive $key - free it up in GNOME Settings -> Keyboard"
-    else
-        python3 -I "$SRC/tools/gnome-shortcut.py" remove >/dev/null || true
-    fi
-    howto="Hold $key, speak, release - the text is typed about 2 s later."
-else
-    bash "$SRC/tools/remove-keywatch.sh"     # left over from a hold-to-talk install
-    python3 -I "$SRC/tools/gnome-shortcut.py" set "$accel" "$BIN/npu-voice-to-text toggle" \
-        && ok "GNOME shortcut $key -> npu-voice-to-text toggle" \
-        || die "could not create the shortcut - free up $key in GNOME Settings -> Keyboard and re-run"
-    howto="Press $key, speak, press $key again - the text is typed about 2 s later."
-fi
+echo; ok "dictation key: $key"
+howto="Hold $key while speaking, or tap it, speak and tap again - the text is typed about 2 s later."
 
 # --------------------------------------------------------------------------- #
 step "Done"
@@ -281,5 +270,5 @@ cat <<EOF
     $howto
     Logs:            journalctl --user -u npu-voice-to-text -f
     Options:         $OPTIONS (see npu-voice-to-text serve --help), then: systemctl --user restart npu-voice-to-text
-    Key, mode, mic:  re-run ./install.sh
+    Key, mic:        re-run ./install.sh
 EOF

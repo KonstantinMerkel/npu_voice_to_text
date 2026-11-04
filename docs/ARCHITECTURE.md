@@ -5,24 +5,25 @@ This document explains every part of npu-voice-to-text and why it is built the w
 ## The big picture
 
 ```
-          ┌──────────────── root ────────────────┐   ┌───────────────────── your user ─────────────────────┐
-keyboard ─▶ npu-voice-to-text-keywatch                  │   │ npu-voice-to-text serve (systemd user service)            │
- F8 down  │  reads /dev/input/event*              │   │                                                     │
- F8 up    │  "press" / "release" ────────────────────▶│ Daemon ── recording → queue → transcribe → type     │
-          └──────────────────────────────────────┘ socket │                                                  │
-                                    /run/user/UID/npu-voice-to-text.sock                                          │
-                                                       │   Recorder     mic → 16 kHz mono buffer (PortAudio)  │
-                                                       │   Transcriber  whisper-small, CPU → language         │
-                                                       │                whisper-turbo, NPU → text             │
-                                                       │   Keyboard     text → keystrokes for your layout ────┼─▶ Remote Desktop portal ─▶ focused window
-                                                       └─────────────────────────────────────────────────────┘
+                     ┌───────────────────── your user ─────────────────────┐
+ F8 down / up ─▶ GNOME │ npu-voice-to-text serve (systemd user service)      │
+ (global shortcut, ────▶ Daemon ── recording → queue → transcribe → type     │
+  GlobalShortcuts      │                                                     │
+  portal)              │   Recorder     mic → 16 kHz mono buffer (PortAudio)  │
+                       │   Transcriber  whisper-small, CPU → language         │
+                       │                whisper-turbo, NPU → text             │
+                       │   Keyboard     text → keystrokes for your layout ────┼─▶ Remote Desktop portal ─▶ focused window
+                       └─────────────────────────────────────────────────────┘
+ CLI (press, release, toggle, cancel, status) ─▶ /run/user/UID/npu-voice-to-text.sock ─▶ Daemon
 ```
+
+Nothing runs as root. Both connections to the desktop - the dictation key in, the text out - go through xdg-desktop-portal, each allowed once in a GNOME dialog.
 
 One dictation, step by step:
 
-1. **F8 down.** The kernel reports a key event on `/dev/input/eventN`. `npu-voice-to-text-keywatch` sees it and sends `press` to the daemon's Unix socket.
+1. **F8 down.** GNOME recognizes the global shortcut and the portal sends `Activated` to the daemon.
 2. The daemon opens the microphone, and audio chunks are appended to a buffer.
-3. **F8 up.** The watcher sends `release`. The daemon closes the mic and starts a thread for steps 4–6, so the socket stays responsive.
+3. **F8 up.** The portal sends `Deactivated`. The daemon closes the mic and queues the recording for a worker thread (steps 4–6).
 4. The small Whisper model on the CPU listens to the recording and produces a single token: the language.
 5. The large Whisper model on the NPU transcribes the recording, with that language set explicitly.
 6. The text is converted into keystrokes for your current keyboard layout and sent through GNOME's Remote Desktop portal, which types them like a second keyboard.
@@ -35,21 +36,19 @@ Typical timing for a 5 s sentence: ~0.5 s language detection + ~1.6 s transcript
 |---|---|
 | `src/npu_voice_to_text/` → venv | The daemon and CLI, a Python package (`pyproject.toml`) that `install.sh` installs into the venv (built from a temporary copy, so a stale `build/` can never leak in). See "Code layout" below. |
 | `~/.local/bin/npu-voice-to-text` | A two-line launcher written by `install.sh`: `venv/bin/python -I -m npu_voice_to_text`. `-I` keeps `PYTHONPATH` and the current directory out of the imports. |
-| `tests/` | pytest suite. Needs only `numpy` and libxkbcommon: `uvx --with numpy pytest` |
-| `npu-voice-to-text-keywatch.py` → `/usr/local/bin/npu-voice-to-text-keywatch` | Root key watcher, standard library only |
+| `tests/` | pytest suite. Needs only `numpy`, `jeepney` and libxkbcommon: `uvx --with numpy --with jeepney pytest` |
 | `systemd/npu-voice-to-text.service` → `~/.config/systemd/user/` | User service. Sets `LD_LIBRARY_PATH` to the NPU libs. |
-| `systemd/npu-voice-to-text-keywatch@.service` → `/etc/systemd/system/` | Template unit. The instance name is your UID. |
-| `/etc/npu-voice-to-text/keywatch-<uid>.env` | The hold key (`KEY=F8`), written by `install.sh` |
-| `tools/gnome-shortcut.py` | Used by `install.sh`/`uninstall.sh` to manage the one `npu-voice-to-text` GNOME shortcut |
+| `data/io.github.KonstantinMerkel.NpuVoiceToText.desktop` → `~/.local/share/applications/` | The app's identity for the portals (hidden from the app grid) |
+| `tools/gnome-keys.py` | Used by `install.sh`/`uninstall.sh`: show the dictation key, or reset its binding (to change the key, and on uninstall) |
+| dconf `/org/gnome/settings-daemon/global-shortcuts/io.github.KonstantinMerkel.NpuVoiceToText/` | The dictation key, stored by GNOME |
 | `~/.local/share/npu-voice-to-text/venv` | Python: `openvino-genai`, `numpy`, `sounddevice`, `huggingface_hub` |
 | `~/.local/share/npu-voice-to-text/lib` | Intel NPU userspace driver and compiler (see "The NPU software stack") |
 | `~/.local/share/npu-voice-to-text/models` | Whisper models in OpenVINO format (~1.1 GB) |
 | `~/.cache/npu-voice-to-text` | Compiled model blobs, so later starts take seconds instead of minutes |
 | `~/.config/npu-voice-to-text/options` | `serve` options, one per line, e.g. the microphone (written by `install.sh`) |
 | `tools/microphones.py` | Lists microphones for `install.sh` |
-| `tools/remove-keywatch.sh` | Removes the key watcher (`install.sh` when switching to toggle mode, `uninstall.sh`) |
 | `$XDG_RUNTIME_DIR/npu-voice-to-text.sock` | Control socket (mode 0600) |
-| `~/.local/state/npu-voice-to-text/remote-desktop-token` | Restore token of the keyboard permission (mode 0600). Removed, and the permission revoked, by `uninstall.sh` |
+| `~/.local/state/npu-voice-to-text/keyboard-access.token` | Restore token of the keyboard permission (mode 0600). Removed, and the permission revoked, by `uninstall.sh` |
 
 ### Code layout
 
@@ -61,34 +60,32 @@ One module per component. Modules marked *stdlib* import only the standard libra
 | `client` | `request()`: one line to the socket, one line back | stdlib |
 | `paths`, `models` | XDG locations; model ids, `model_path()`, `download` | stdlib |
 | `keyboard` | `XkbKeymap` (layout → keystrokes, substitutes), `Keyboard` (types a text) | stdlib + ctypes |
-| `portal` | `RemoteKeyboard`: RemoteDesktop portal sessions, restore token | jeepney (D-Bus) |
+| `portal` | `GlobalShortcut` (the dictation key), `RemoteKeyboard` (typing sessions, restore token) | jeepney (D-Bus) |
 | `audio` | `speech_stats()` (speech detector), `Recorder` (PortAudio) | numpy |
 | `transcriber` | `Transcriber`: language choice, Whisper, hallucination filter | numpy, OpenVINO on `load()` |
 | `daemon` | `Daemon`: state machine, queue, worker, socket server | all of the above |
 
 **Dependencies are passed in.** `Daemon(transcriber, recorder, keyboard)` and `Transcriber(pipe, detector, …)` take their parts as arguments. `Daemon.from_args()` and `Transcriber.load()` build the real ones (NPU, microphone, portal). The tests pass fakes instead, so they cover the state machine, the portal's request flow (against a fake D-Bus connection), recording overlapping transcription, typing pausing while you record, language choice and the socket server without any hardware. The keymap tests use the real libxkbcommon, so they check the actual German and US layouts.
 
-The key watcher stays a single standalone script outside the package: root runs a root-owned copy of it, and it must not import anything from a user-writable venv.
-
 ---
 
 ## Component by component
 
-### npu-voice-to-text-keywatch: why a root process at all?
+### Dictation key: GlobalShortcuts portal
 
-Hold-to-talk needs to know when a key is **released**. GNOME's custom shortcuts only fire on press, and Wayland deliberately doesn't let normal apps listen to global key events. The only reliable source is the kernel's input devices, `/dev/input/event*`. They belong to `root:input` with mode `0660`.
+Hold-to-talk needs to know when a key is **released**. GNOME's custom shortcuts only fire on press, and Wayland deliberately doesn't let normal apps listen to global key events. The [GlobalShortcuts portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.GlobalShortcuts.html) does both, with the user's consent (`GlobalShortcut` in `portal.py`):
 
-There were two options:
-- **Add your user to `input`.** Simple, but then *every* program running as you could read every keystroke (passwords included). It's a keylogger permission.
-- **A tiny root service** that forwards nothing but press/release of one key. This is the chosen option.
+1. **App identity.** The portal refuses apps without an app ID (`NotAllowed: An app id is required`). A host app (not Flatpak) registers one with `org.freedesktop.host.portal.Registry.Register` as its connection's first portal call. The portal only accepts IDs with an installed desktop file ("App info not found" otherwise), so `install.sh` installs a hidden one (`NoDisplay=true`). GNOME's dialogs show its name. The typing sessions register the same ID.
+2. `CreateSession`, then `BindShortcuts` with one shortcut, `dictate`, suggesting F8. The first time, GNOME shows "Add Keyboard Shortcuts": the user confirms F8 or presses another key. GNOME stores the binding in dconf (`/org/gnome/settings-daemon/global-shortcuts/<app ID>/`). After that, `BindShortcuts` returns at once, without a dialog.
+3. The signals `Activated` (key down) and `Deactivated` (key up) call `Daemon.key_down()` / `key_up()`. One key does both ways of dictating: key down starts a recording; key up stops it, unless the key was down for less than 0.4 s (`TAP_SECONDS`). After such a tap the recording continues, and the next key down stops it (its key up is then ignored). A key down after the 120 s limit stopped a tapped recording counts as that stop, not as a new start. Measured on GNOME 50: release arrives within milliseconds, also for a 0.1 s tap. While the key is held, GNOME repeats `Activated` every ~30 ms (keyboard autorepeat), so only the first one counts.
 
-How it works:
-- It finds keyboards through udev's symlinks (`/dev/input/by-path/*-event-kbd`) and rescans every 3 s, so hot-plugged keyboards (docks, receivers) are picked up.
-- It reads raw `struct input_event` records (24 bytes: time, type, code, value).
-- For `EV_KEY` events with our key code, `value` 1 means press and 0 means release. Value 2 is autorepeat and is ignored.
-- It doesn't *grab* the device (`EVIOCGRAB`), because grabbing would block the whole keyboard. So the key also reaches the focused app. `install.sh` therefore binds it to a GNOME shortcut with command `true`, and GNOME consumes it. A lone modifier (RIGHTCTRL) produces no input anyway, so it needs no shortcut.
+The session lives as long as the daemon's D-Bus connection. If the portal closes the session or restarts (seen as `NameOwnerChanged` of its bus name), the listener binds again after 5 s (silently: the binding persists). If the user declines or closes the dialog, it logs `no dictation key` and stops instead of asking again; `npu-voice-to-text status` then says `no dictation key`, which `install.sh` watches for.
 
-The unit hardening (`CapabilityBoundingSet=CAP_DAC_OVERRIDE`, `ProtectSystem=strict`, `PrivateNetwork`, `RestrictAddressFamilies=AF_UNIX`, …) means that even as root, this process can only read files, talk over Unix sockets, and bypass file permissions. It needs the last one to connect to your `0600` socket. It runs a root-owned copy in `/usr/local/bin`, never the user-writable one in `~/.local/bin`. Otherwise any program running as you could edit the file and get root.
+While the key is held, GNOME repeats `Activated` (autorepeat); only the first counts. If a `Deactivated` gets lost (lock screen, a grab), the next `Activated` after a pause of over 3 s counts as a new press, and the missing release is delivered first, so the key doesn't stay "held" forever.
+
+The key needs GNOME 48 or newer, which brought the GlobalShortcuts portal; `install.sh` checks the version. There is no fallback for older GNOME.
+
+To change the key, `install.sh` resets the dconf binding (`tools/gnome-keys.py reset`), and the next start shows the dialog again. A lone modifier (Right Ctrl) can't be a GNOME shortcut; versions up to 0.3 supported it with a root service that read `/dev/input`, which is gone now.
 
 ### Daemon and socket protocol
 
@@ -102,9 +99,9 @@ The unit hardening (`CapabilityBoundingSet=CAP_DAC_OVERRIDE`, `ProtectSystem=str
 | `cancel` | stop recording and discard it | `cancelled` |
 | `status` | | `idle`, `recording`, `transcribing N` or `recording, transcribing N` |
 
-`npu-voice-to-text press|release|toggle|cancel|status` is the client. It only imports the standard library, so it reacts instantly when bound to a shortcut. A press while the previous dictation is still being transcribed starts the next recording right away. Recordings are transcribed and typed one at a time, in order, so two dictations never type over each other. Text is only typed while no recording runs: with RIGHTCTRL or RIGHTMETA as the hold key, typing while the key is held would turn the characters into shortcuts. Typing therefore pauses when a recording starts. It checks before each character, so it pauses between whole characters and never leaves Shift or AltGr held down. Only the character being typed at the moment of the key press can still be hit (a few ms). A `toggle` after the 120 s limit already stopped the recording doesn't start a new one.
+`npu-voice-to-text press|release|toggle|cancel|status` is the client, for scripts and your own shortcuts (`cancel`, for example); the dictation key doesn't need it. It only imports the standard library, so it reacts instantly. A press while the previous dictation is still being transcribed starts the next recording right away. Recordings are transcribed and typed one at a time, in order, so two dictations never type over each other. Text is only typed while no recording runs, never into the window while you dictate the next one. Typing therefore pauses when a recording starts. It checks before each character, so it pauses between whole characters and never leaves Shift or AltGr held down. Only the character being typed at the moment of the key press can still be hit (a few ms). A `toggle` after the 120 s limit already stopped the recording doesn't start a new one.
 
-Why a socket and not D-Bus or signals: it needs no extra dependencies, the permissions are simply file permissions, and root (the key watcher) can reach it without joining your session bus.
+Why a socket and not D-Bus: the client stays standard-library only (instant start), and the permissions are simply file permissions.
 
 ### Recorder
 
@@ -142,7 +139,7 @@ Comparing how confident the model is with each language forced (de vs en) would 
 ### Keyboard (text output)
 
 **How text gets into another window.** Wayland doesn't let one app type into another. The sanctioned way is the [RemoteDesktop portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html) (`portal.py`, D-Bus through the pure-Python `jeepney`):
-1. `CreateSession`, `SelectDevices` (keyboard only, `persist_mode=2`: until revoked), `Start`. The first time, GNOME shows a dialog and the user allows keyboard access. The portal stores that in its permission store (table `remote-desktop`, keyed by a *restore token*) and returns the token. npu-voice-to-text keeps it in `~/.local/state/npu-voice-to-text/remote-desktop-token` (0600). A token is single-use: each `Start` returns the next one, which replaces it.
+1. `CreateSession`, `SelectDevices` (keyboard only, `persist_mode=2`: until revoked), `Start`. The first time, GNOME shows a dialog and the user allows keyboard access. The portal stores that in its permission store (table `remote-desktop`, keyed by a *restore token*) and returns the token. npu-voice-to-text keeps it in `~/.local/state/npu-voice-to-text/keyboard-access.token` (0600). A token is single-use: each `Start` returns the next one, which replaces it.
 2. With the token, `Start` succeeds without a dialog in ~20 ms. So each dictation opens its own session, types, and closes it: a session, and anything GNOME shows for it, only exists while text is typed.
 3. Keys are sent with `NotifyKeyboardKeycode` (evdev codes, one D-Bus call per key event). The compositor interprets them with the active layout, exactly like a real keyboard.
 
@@ -191,7 +188,8 @@ How to check the NPU is really used: `cat /sys/bus/pci/devices/0000:00:0b.0/npu_
 | **ydotool** (used until 0.2) | Needs `ydotoold`, a root daemon whose socket can type anything, set up by hand. The portal does the same with the user's consent and nothing to set up. |
 | **Clipboard + paste** (as an output mode, or as the fallback for characters the layout lacks) | Overwrites the clipboard, terminals need a different shortcut, and restoring the clipboard is fragile. Dictation produces German and English text, which every layout can type with a few substitutes (`ä` → `ae` on a US layout). |
 | **Keysyms** (`NotifyKeyboardKeysym`) or **libei** | Only reach what the layout has directly - no dead keys, no Shift+AltGr level (see Keyboard). |
-| **User in the `input` group** | Lets every program you run read every keystroke. See the key watcher above. |
+| **User in the `input` group** (to read `/dev/input`) | Lets every program you run read every keystroke. |
+| **A root service reading `/dev/input`** (used until 0.3) | Worked for hold-to-talk, but needed root, sudo at install, and a "do-nothing" GNOME shortcut so apps didn't also get the key. The GlobalShortcuts portal reports press and release without any of that. |
 | **Live text while speaking** (re-transcribe every ~1.6 s, type words two passes agree on, fix the rest with Backspace) | Built and tried. Whisper isn't a streaming model and each NPU pass has a fixed ~1.6 s cost, so words appeared 3–5 s late and were then visibly corrected. Removed in favour of one clean result on release. |
 | **Streaming models** (NVIDIA Nemotron 3.5 ASR Streaming, ~0.3 s latency, German and English) | A promising future option, but: no tested NPU build with small chunks, and noticeably more errors than Whisper turbo. Not worth it for now. |
 | **Forced `--language de`** | Whisper translates English speech into German. Hence detection limited to de/en. |
@@ -209,29 +207,7 @@ How to check the NPU is really used: `cat /sys/bus/pci/devices/0000:00:0b.0/npu_
 
 ## Roadmap
 
-**Goal: no root component.** The root key watcher is a workaround for something Wayland now offers through a desktop portal: global shortcuts with press *and* release. Typing already moved from ydotool to the RemoteDesktop portal (done, see Keyboard); its `portal.py` (session handling, the portal's Request/Response pattern, `jeepney`) is the base for the GlobalShortcuts portal too.
+The goal of the earlier roadmap - **no root component, no ydotool** - is reached: the dictation key comes from the GlobalShortcuts portal (0.4), typing goes through the RemoteDesktop portal (0.3). Both were verified on GNOME 50 before replacing the old mechanisms.
 
-### 1. Hold key: GlobalShortcuts portal (replaces the root key watcher)
-
-[`org.freedesktop.portal.GlobalShortcuts`](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.GlobalShortcuts.html), supported by GNOME since 48:
-
-1. `CreateSession`, then `BindShortcuts` with one shortcut (`dictate`, preferred trigger `F8`). GNOME asks the user once to confirm the key and remembers it.
-2. The signals `Activated` and `Deactivated` (key down / key up) call `Daemon.press()` / `release()` directly. No socket hop, no root service, and no "do-nothing" GNOME shortcut, since the compositor consumes the key itself.
-
-What it removes: `npu-voice-to-text-keywatch`, its systemd unit, `/etc/npu-voice-to-text`, the sudo step in `install.sh` and `tools/remove-keywatch.sh`.
-
-To find out first (a short spike):
-- **Does GNOME emit `Deactivated` on key release, every time?** That is the whole point. If GNOME only emits it right after `Activated`, hold-to-talk can't use the portal, but toggle mode still could.
-- **App identity.** A host app (not Flatpak) needs an app ID for the portal to remember its shortcuts: via `org.freedesktop.host.portal.Registry`, or from the name of the systemd unit / scope it runs in.
-- **Which triggers are allowed.** A lone RIGHTCTRL probably isn't. Those keys would keep the key watcher, or be dropped.
-- **Lifecycle.** The session is tied to the D-Bus connection, so it is re-created after a daemon restart (the binding itself persists).
-
-### ~~2. Typing: RemoteDesktop portal (replaces ydotool)~~ - done
-
-Implemented with key codes, see Keyboard. The open questions were answered by testing on GNOME 50: keysyms only reach what the layout has directly (no dead keys, no Shift+AltGr level, nothing off the layout), so key codes computed with libxkbcommon stay; characters the layout lacks are replaced instead of pasted; one short session per dictation means no session stays open between dictations.
-
-### Smaller items
-
-- **If the key watcher stays** (other desktops, modifier keys): run it as a dedicated non-root user in the `input` group (`DynamicUser=` + `SupplementaryGroups=input`) instead of root with `CAP_DAC_OVERRIDE`. It would then offer the socket, and the user daemon would connect to it.
 - **Voice detection:** a small VAD model (e.g. Silero VAD on the CPU) instead of the energy detector. It would likely replace the hand-tuned thresholds and most of the hallucination list.
 - **Re-check the CPU language-detection workaround** with every OpenVINO GenAI upgrade. If NPU auto-detection gets fixed, the second model can go.

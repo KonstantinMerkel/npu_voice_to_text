@@ -1,0 +1,10 @@
+[Desktop Entry]
+# Identifies npu-voice-to-text to the desktop portals (dictation key, typing), and
+# names it in GNOME's dialogs. Hidden from the app grid. install.sh puts the
+# launcher's full path into Exec.
+Type=Application
+Name=npu-voice-to-text
+Comment=Dictation: speech to text on the Intel NPU
+Icon=audio-input-microphone
+Exec=npu-voice-to-text toggle
+NoDisplay=true
