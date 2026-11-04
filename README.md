@@ -49,7 +49,7 @@ The installer:
 5. downloads the two Whisper models (~1.1 GB);
 6. asks for the **settings**: Recommended or Custom (see below);
 7. starts the systemd user service and waits until it's ready. On the very first start, **GNOME shows two dialogs**:
-   - **"Remote Desktop"**: allow keyboard access, otherwise nothing can be typed.
+   - **"Remote Desktop"**: switch on **"Allow Remote Interaction"**, keep "Remember This Selection" ticked, and click Share. That's keyboard access; without it nothing can be typed. The dialog doesn't name the app: GNOME shows no app name for keyboard-only access.
    - **"Add Keyboard Shortcuts"**: confirm F8 as the dictation key, or press the key you want.
 
    See [Privacy and security](#privacy-and-security) for what exactly they allow. The first start also compiles the model for the NPU, which takes a few minutes.

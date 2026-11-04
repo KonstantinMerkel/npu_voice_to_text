@@ -301,9 +301,10 @@ systemctl --user daemon-reload
 systemctl --user enable --quiet npu-voice-to-text
 if [[ ! -s $TOKEN ]]; then
     cat <<'EOF'
-    GNOME dialog: "Remote Desktop" - please allow it.
-      npu-voice-to-text types the dictated text into other windows, so it asks for
-      keyboard access. Only the keyboard: no mouse, no screen sharing.
+    GNOME dialog "Remote Desktop": switch on "Allow Remote Interaction", keep
+      "Remember This Selection" ticked, then click Share. This lets npu-voice-to-text
+      type the dictated text into other windows: keyboard only, no mouse, no screen.
+      (GNOME's dialog names no app for keyboard-only access.)
 EOF
 fi
 if [[ -z $key ]]; then
@@ -322,7 +323,7 @@ for (( i = 0; ; i++ )); do
         echo
         # exit status 3: keyboard access declined (or the dialog was left unanswered)
         [[ $(systemctl --user show -p ExecMainStatus --value npu-voice-to-text) == 3 ]] &&
-            die "no keyboard access - re-run ./install.sh and allow it in the GNOME dialog"
+            die "no keyboard access - re-run ./install.sh; in the GNOME dialog switch on \"Allow Remote Interaction\", keep \"Remember This Selection\" ticked, click Share"
         die "the service failed - see: journalctl --user -u npu-voice-to-text"
     fi
     # Restart=on-failure every 5 s never hits systemd's start limit, so a crash loop

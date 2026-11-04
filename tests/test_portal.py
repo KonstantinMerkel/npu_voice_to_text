@@ -35,7 +35,8 @@ class FakePortal:
         results = {"CreateSession": (0, {"session_handle": ("s", "/session/1")}),
                    "SelectDevices": (0, {}),
                    "Start": (self.start_code, {"devices": ("u", self.devices),
-                                               "restore_token": ("s", self.token)})}
+                                               **({"restore_token": ("s", self.token)}
+                                                  if self.token else {})})}
         self._pending = results.get(member)
         return None
 
@@ -108,6 +109,13 @@ def test_no_keyboard_granted(token_file):
     portal = FakePortal(devices=2)                           # pointer only
     with pytest.raises(AccessDenied):
         RemoteKeyboard(token_file, connect=lambda: portal).open()
+
+
+def test_not_remembered(token_file):
+    portal = FakePortal(token=None)                          # "Remember This Selection" off
+    with pytest.raises(AccessDenied, match="not remembered"):
+        RemoteKeyboard(token_file, connect=lambda: portal).open()
+    assert not token_file.exists()
 
 
 def test_dialog_ignored(token_file):

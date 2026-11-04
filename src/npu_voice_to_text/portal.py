@@ -88,8 +88,10 @@ class RemoteKeyboard:
             res = _request(conn, portal, "Start", "osa{sv}", [session, "", {}], 2, timeout)
             if not res.get("devices", ("u", 0))[1] & KEYBOARD:
                 raise AccessDenied("the portal granted no keyboard")
-            if "restore_token" in res:
-                self._write_token(res["restore_token"][1])
+            if "restore_token" not in res:
+                # "Remember This Selection" was unticked: every dictation would ask again
+                raise AccessDenied("not remembered (\"Remember This Selection\" was off)")
+            self._write_token(res["restore_token"][1])
             return Session(conn, portal, session, new_method_call)
         except BaseException:
             conn.close()
