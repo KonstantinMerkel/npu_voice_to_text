@@ -46,7 +46,7 @@ The installer:
 2. creates a Python venv and installs the program into it;
 3. fetches Intel's NPU driver and compiler (checksum-verified);
 4. checks that OpenVINO sees the NPU;
-5. downloads the two Whisper models (~1.1 GB);
+5. downloads the two Whisper models (~1.1 GB; re-running it finishes an interrupted download);
 6. asks for the **settings**: Recommended or Custom (see below);
 7. starts the systemd user service and waits until it's ready. On the very first start, **GNOME shows two dialogs**:
    - **"Remote Desktop"**: switch on **"Allow Remote Interaction"**, keep "Remember This Selection" ticked, and click Share. That's keyboard access; without it nothing can be typed. The dialog doesn't name the app: GNOME shows no app name for keyboard-only access.

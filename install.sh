@@ -119,7 +119,9 @@ printf '#!/bin/bash\nexec %q -I -m npu_voice_to_text "$@"\n' "$DATA/venv/bin/pyt
 chmod 755 "$BIN/npu-voice-to-text"
 ok "$BIN/npu-voice-to-text"
 for model in "$MODEL" "$DETECT_MODEL"; do
-    if [[ -e "$DATA/models/${model##*/}/openvino_encoder_model.xml" ]]; then
+    # the marker is written when a download finished (models.py COMPLETE_MARKER);
+    # without it, `download` finishes an interrupted one
+    if [[ -e "$DATA/models/${model##*/}/.download-complete" ]]; then
         ok "${model##*/} already downloaded"
     else
         "$BIN/npu-voice-to-text" download --model "$model"
