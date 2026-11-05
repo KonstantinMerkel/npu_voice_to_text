@@ -302,7 +302,20 @@ step "Service"
 mkdir -p "${DESKTOP%/*}"
 sed "s|^Exec=npu-voice-to-text |Exec=\"$BIN/npu-voice-to-text\" |" \
     "$SRC/data/$APP_ID.desktop" > "$DESKTOP"
-install -Dm644 "$SRC/systemd/npu-voice-to-text.service" "$UNITS/npu-voice-to-text.service"
+# The unit gets the paths this script used: systemd's environment may have other
+# (or no) XDG_* values than this shell, and the daemon would look elsewhere.
+unit_value() { local s=${1//\\/\\\\}; s=${s//\"/\\\"}; printf '"%s"' "${s//%/%%}"; }
+env_lines="Environment=$(unit_value "LD_LIBRARY_PATH=$DATA/lib")"
+for var in DATA:.local/share CONFIG:.config STATE:.local/state CACHE:.cache; do
+    name=XDG_${var%%:*}_HOME
+    value=${!name:-$HOME/${var#*:}}
+    env_lines+=$'\n'"Environment=$(unit_value "$name=$value")"
+done
+unit=$(<"$SRC/systemd/npu-voice-to-text.service")
+lib_line='Environment=LD_LIBRARY_PATH=%h/.local/share/npu-voice-to-text/lib'
+[[ $unit == *"$lib_line"* ]] || die "systemd/npu-voice-to-text.service: no '$lib_line' line"
+mkdir -p "$UNITS"
+printf '%s\n' "${unit/"$lib_line"/"$env_lines"}" > "$UNITS/npu-voice-to-text.service"
 systemctl --user daemon-reload
 systemctl --user enable --quiet npu-voice-to-text
 if [[ ! -s $TOKEN ]]; then

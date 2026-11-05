@@ -9,7 +9,8 @@ PartOf=graphical-session.target
 #   systemctl --user restart npu-voice-to-text
 ExecStart=%h/.local/bin/npu-voice-to-text serve
 # Intel's NPU userspace driver + compiler, matching the pip OpenVINO version
-# (installed by install.sh; distro packages are often too old)
+# (installed by install.sh; distro packages are often too old). install.sh replaces
+# this line with the paths it used: LD_LIBRARY_PATH and the XDG_*_HOME directories.
 Environment=LD_LIBRARY_PATH=%h/.local/share/npu-voice-to-text/lib
 Restart=on-failure
 RestartSec=5
