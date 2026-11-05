@@ -28,6 +28,8 @@ SILENT_START_WARNING = 0.3  # seconds of digital silence at the start worth a wa
 CLIENT_TIMEOUT = 2.0        # seconds a client may take to send its command
 TAP_SECONDS = 0.4           # a shorter key press is a tap: keep recording until the next press
 EXIT_NO_KEYBOARD = 3        # keyboard access declined: the unit doesn't restart on it
+LIMIT_STOP_SECONDS = 10.0   # a press this soon after the time limit stopped a recording
+                            # is the user's "stop" for it, not a new start
 
 
 def check_keyboard_access(keyboard):
@@ -72,7 +74,7 @@ class Daemon:
         self.lock = threading.Lock()
         self.mic_free = threading.Condition(self.lock)    # notified when a recording ends
         self.recording = False
-        self.limit_stopped = False    # the time limit ended the recording, not the user
+        self.limit_stopped_at = None  # when the time limit ended the recording (monotonic)
         self.pending = 0                                  # recordings not yet typed
         self.jobs: queue.SimpleQueue = queue.SimpleQueue()
         self.floors = collections.deque(maxlen=5)          # noise floors of recent clips
@@ -119,7 +121,7 @@ class Daemon:
         with self.lock:
             if self.recording:
                 return "busy (recording)"
-            self.limit_stopped = False
+            self.limit_stopped_at = None
             # the mic records the start sound, so that part of the audio is dropped
             try:
                 self.recorder.start(skip=SOUND_START_SKIP if self.sounds else 0.0)
@@ -135,7 +137,8 @@ class Daemon:
             if not self.recording:
                 # a stop that arrives after the time limit already stopped the
                 # recording has done its job: the next toggle starts a new one
-                stopped_by_limit, self.limit_stopped = self.limit_stopped, False
+                stopped_by_limit = self._limit_just_stopped()
+                self.limit_stopped_at = None
                 return ("not recording (stopped by the time limit)" if stopped_by_limit
                         else "not recording")
             self._stop_and_queue()
@@ -152,22 +155,28 @@ class Daemon:
     def toggle(self) -> str:
         if self.recording:
             return self.release()
-        if self.limit_stopped:
+        if self._limit_just_stopped():
             # the user's "stop" after the time limit already stopped the recording:
             # don't start a new one
-            self.limit_stopped = False
+            self.limit_stopped_at = None
             return "not recording (stopped by the time limit)"
         return self.press()
 
+    def _limit_just_stopped(self) -> bool:
+        """The time limit stopped a recording within LIMIT_STOP_SECONDS: a stop
+        arriving now is meant for it. Later, a press is a new dictation."""
+        return (self.limit_stopped_at is not None
+                and time.monotonic() - self.limit_stopped_at < LIMIT_STOP_SECONDS)
+
     def _limit_reached(self):
         # checked and stopped under one lock: a release + press in between must not
-        # get its new recording stopped, nor leave limit_stopped set
+        # get its new recording stopped, nor leave limit_stopped_at set
         with self.lock:
             if not self.recording:
                 return
             print(f"  recording stopped after the {MAX_SECONDS} s limit", flush=True)
             self._stop_and_queue()
-            self.limit_stopped = True
+            self.limit_stopped_at = time.monotonic()
         self._sound(SOUND_STOP)
 
     def cancel(self) -> str:
@@ -188,7 +197,7 @@ class Daemon:
         with self.commands:
             print(f"key down ({self.status()})", flush=True)
             self._key_down_at = time.monotonic()
-            self._ignore_key_up = self.recording or self.limit_stopped
+            self._ignore_key_up = self.recording or self._limit_just_stopped()
             self.toggle()
 
     def key_up(self):
@@ -201,7 +210,7 @@ class Daemon:
                 if self.recording:
                     print("  short press: recording until the next press", flush=True)
                 return
-            self.release()      # also clears limit_stopped if the limit stopped it while held
+            self.release()      # also clears limit_stopped_at if the limit stopped it while held
 
     def handle(self, cmd: str) -> str:
         actions = {"press": self.press, "release": self.release, "toggle": self.toggle,

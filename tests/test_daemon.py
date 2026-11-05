@@ -356,3 +356,17 @@ def test_keyboard_check_exits_3_only_when_declined(error, code):
     with pytest.raises(SystemExit) as exit_:
         check_keyboard_access(SimpleNamespace(check_access=check_access))
     assert exit_.value.code == code
+
+
+def test_press_long_after_the_time_limit_starts_a_new_dictation(make, tap, monkeypatch):
+    """Only a press soon after the limit is its "stop": one minutes later records."""
+    import npu_voice_to_text.daemon as daemon_mod
+    tap(True)
+    d, _, _, _ = make(texts=["eins", "zwei"])
+    d.key_down(), d.key_up()
+    d._limit_reached()
+    now = time.monotonic()
+    monkeypatch.setattr(daemon_mod.time, "monotonic",
+                        lambda: now + daemon_mod.LIMIT_STOP_SECONDS + 1)
+    d.key_down()
+    assert d.status().startswith("recording")
