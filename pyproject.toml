@@ -31,9 +31,10 @@ test = ["pytest>=8", "numpy>=2", "jeepney>=0.8"]
 [tool.setuptools.dynamic]
 version = { attr = "npu_voice_to_text.__version__" }
 
-[tool.setuptools.packages.find]
-where = ["src"]
+# the package npu_voice_to_text is the src/ directory itself
+[tool.setuptools]
+package-dir = { npu_voice_to_text = "src" }
+packages = ["npu_voice_to_text"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["src"]
+testpaths = ["tests"]           # tests/conftest.py makes src/ importable as npu_voice_to_text

@@ -1,7 +1,20 @@
+import atexit
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
 import numpy as np
 import pytest
 
-from npu_voice_to_text.audio import SAMPLE_RATE
+# src/ is the package npu_voice_to_text (pyproject.toml maps the name). For the
+# tests, a temporary directory with a symlink of that name goes on the import path.
+_shim = Path(tempfile.mkdtemp(prefix="npu-voice-to-text-tests-"))
+(_shim / "npu_voice_to_text").symlink_to(Path(__file__).resolve().parents[1] / "src")
+sys.path.insert(0, str(_shim))
+atexit.register(shutil.rmtree, _shim, ignore_errors=True)
+
+from npu_voice_to_text.audio import SAMPLE_RATE  # noqa: E402
 
 
 def tone(seconds: float, amplitude: float = 0.1, freq: float = 220.0):

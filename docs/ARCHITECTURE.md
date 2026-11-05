@@ -34,7 +34,7 @@ Typical timing for a 5 s sentence: ~0.5 s language detection + ~1.6 s transcript
 
 | Path | What |
 |---|---|
-| `src/npu_voice_to_text/` → venv | The daemon and CLI, a Python package (`pyproject.toml`) that `install.sh` installs into the venv (built from a temporary copy, so a stale `build/` can never leak in). See "Code layout" below. |
+| `src/` → venv | The daemon and CLI, the Python package `npu_voice_to_text` (`pyproject.toml` maps the name to `src/`) that `install.sh` installs into the venv (built from a temporary copy, so a stale `build/` can never leak in). See "Code layout" below. |
 | `~/.local/bin/npu-voice-to-text` | A two-line launcher written by `install.sh`: `venv/bin/python -I -m npu_voice_to_text`. `-I` keeps `PYTHONPATH` and the current directory out of the imports. |
 | `tests/` | pytest suite. Needs only `numpy`, `jeepney` and libxkbcommon: `uvx --with numpy --with jeepney pytest` |
 | `systemd/npu-voice-to-text.service` → `~/.config/systemd/user/` | User service. Sets `LD_LIBRARY_PATH` to the NPU libs. |

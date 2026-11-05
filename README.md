@@ -143,7 +143,7 @@ key down/up ─▶ GNOME global shortcut (portal) ──────────
 | Wrong characters | The log prints `keymap <layout>`. Set `--layout` if that's wrong. Check that Caps Lock is off. Characters your layout has no key for are replaced (`ä` → `ae`) or, like emoji, left out (`no key on this layout, left out: …` in the log). |
 | Characters missing | Re-run `./install.sh`, change the settings, typing speed "careful" (or `--key-delay` 8–12). |
 | English comes out as German | Don't use `--language`. See also Known issues. |
-| "Untertitel der Amara.org-Community" etc. | A Whisper hallucination on silence. Add it to `HALLUCINATIONS` in `src/npu_voice_to_text/transcriber.py` and re-run `./install.sh`. |
+| "Untertitel der Amara.org-Community" etc. | A Whisper hallucination on silence. Add it to `HALLUCINATIONS` in `src/transcriber.py` and re-run `./install.sh`. |
 
 
 ## Known issues
@@ -155,7 +155,7 @@ key down/up ─▶ GNOME global shortcut (portal) ──────────
 
 ## Development
 
-The program is the Python package in `src/npu_voice_to_text/` (one module per component, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#files)). The tests need neither the NPU, OpenVINO nor a microphone, only `numpy`, `jeepney` and libxkbcommon:
+The program is the Python package `npu_voice_to_text` in `src/` (one module per component, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#files)). The tests need neither the NPU, OpenVINO nor a microphone, only `numpy`, `jeepney` and libxkbcommon:
 
 ```bash
 uvx --with numpy --with jeepney pytest
