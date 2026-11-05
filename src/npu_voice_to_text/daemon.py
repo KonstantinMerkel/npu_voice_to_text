@@ -18,7 +18,7 @@ from .audio import (MAX_SECONDS, MIN_SPEECH_SECONDS, NOISE_FLOOR_MIN, SAMPLE_RAT
                     silent_start, speech_stats)
 from .client import daemon_running
 from .keyboard import Keyboard
-from .portal import GlobalShortcut
+from .portal import AccessDenied, GlobalShortcut, NoAnswer
 from .transcriber import Transcriber, lang_code
 
 SOUND_START = "/usr/share/sounds/freedesktop/stereo/device-added.oga"
@@ -28,6 +28,21 @@ SILENT_START_WARNING = 0.3  # seconds of digital silence at the start worth a wa
 CLIENT_TIMEOUT = 2.0        # seconds a client may take to send its command
 TAP_SECONDS = 0.4           # a shorter key press is a tap: keep recording until the next press
 EXIT_NO_KEYBOARD = 3        # keyboard access declined: the unit doesn't restart on it
+
+
+def check_keyboard_access(keyboard):
+    """Exit EXIT_NO_KEYBOARD if the user declined or ignored the dialog. Any other
+    error (portal not up yet at login, D-Bus hiccup) exits 1, so systemd retries."""
+    try:
+        keyboard.check_access()
+    except (AccessDenied, NoAnswer) as e:
+        print(f"no keyboard access: {e}\n  re-run ./install.sh to be asked again",
+              file=sys.stderr, flush=True)
+        sys.exit(EXIT_NO_KEYBOARD)                  # systemd doesn't restart on this one
+    except Exception as e:
+        print(f"could not check keyboard access: {e}\n  retrying in a few seconds",
+              file=sys.stderr, flush=True)
+        sys.exit(1)                                 # Restart=on-failure retries
 
 
 class Daemon:
@@ -74,12 +89,7 @@ class Daemon:
         # one after the other: keyboard access, then the dictation key
         print("checking keyboard access (the first start asks for it in a GNOME dialog)",
               flush=True)
-        try:
-            keyboard.check_access()
-        except Exception as e:                      # declined, ignored, or no portal
-            print(f"no keyboard access: {e}\n  re-run ./install.sh to be asked again",
-                  file=sys.stderr, flush=True)
-            sys.exit(EXIT_NO_KEYBOARD)              # systemd doesn't restart on this one
+        check_keyboard_access(keyboard)
         # bound in the background while the models load: the first time, GNOME asks
         # to confirm the key. Presses before the daemon is ready are ignored.
         shortcut = GlobalShortcut(lambda: None, lambda: None)

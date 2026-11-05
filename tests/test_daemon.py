@@ -9,7 +9,8 @@ from types import SimpleNamespace
 import pytest
 
 from npu_voice_to_text.client import request
-from npu_voice_to_text.daemon import Daemon
+from npu_voice_to_text.daemon import EXIT_NO_KEYBOARD, Daemon, check_keyboard_access
+from npu_voice_to_text.portal import AccessDenied, NoAnswer, PortalError
 
 
 class FakeRecorder:
@@ -341,3 +342,17 @@ def test_status_reports_a_declined_key(make):
     d, _, _, _ = make()
     d.shortcut = SimpleNamespace(denied=True)
     assert d.status() == "no dictation key"
+
+
+@pytest.mark.parametrize("error, code", [
+    (AccessDenied("declined"), EXIT_NO_KEYBOARD),
+    (NoAnswer("no answer within 300 s"), EXIT_NO_KEYBOARD),
+    (PortalError("the portal restarted"), 1),      # transient: systemd retries
+    (OSError("no D-Bus session bus"), 1),
+])
+def test_keyboard_check_exits_3_only_when_declined(error, code):
+    def check_access():
+        raise error
+    with pytest.raises(SystemExit) as exit_:
+        check_keyboard_access(SimpleNamespace(check_access=check_access))
+    assert exit_.value.code == code

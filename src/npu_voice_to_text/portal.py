@@ -55,6 +55,10 @@ class AccessDenied(PortalError):
     """The user declined the dialog, or the permission was revoked and declined."""
 
 
+class NoAnswer(PortalError):
+    """No response within the timeout: normally a dialog left open."""
+
+
 class RemoteKeyboard:
     """Opens RemoteDesktop sessions with keyboard access.
 
@@ -298,7 +302,7 @@ def _request(conn, portal, method: str, signature: str, args: list, options_inde
         try:
             code, results = conn.recv_until_filtered(responses, timeout=timeout).body
         except TimeoutError:
-            raise PortalError(f"{method}: no answer within {timeout} s") from None
+            raise NoAnswer(f"{method}: no answer within {timeout} s") from None
     if code in (1, 2):           # 2: the dialog was closed (Escape, window close button)
         raise AccessDenied(f"{method}: {'declined' if code == 1 else 'dialog closed'}")
     if code != 0:
