@@ -61,7 +61,7 @@ def connected_sources() -> set[str] | None:
     """Names of the PipeWire/PulseAudio input sources that can record right now.
 
     Monitors and analog jacks with nothing plugged in (active port "not available",
-    the same check as tools/microphones.py) are left out. None if pactl is missing
+    see microphones()) are left out. None if pactl is missing
     or doesn't answer within 1 s - the caller holds the daemon lock, and the key
     watcher gives up after 3 s.
     """
@@ -74,17 +74,24 @@ def connected_sources() -> set[str] | None:
     return parse_connected_sources(sources)
 
 
-def parse_connected_sources(sources: list[dict]) -> set[str]:
-    """The recordable sources in `pactl -f json list sources` output."""
-    connected = set()
+def microphones(sources: list[dict]) -> list[tuple[dict, bool]]:
+    """The microphones in `pactl -f json list sources` output, each with whether it
+    can record: monitors are left out, and an analog jack whose active port is "not
+    available" has nothing plugged in. Also used by tools/microphones.py (install.sh),
+    so the installer offers the mics the daemon will use."""
+    mics = []
     for src in sources:
         props = src.get("properties", {})
         if src["name"].endswith(".monitor") or props.get("device.class") == "monitor":
             continue
         active = [p for p in src.get("ports", []) if p.get("name") == src.get("active_port")]
-        if not (active and active[0].get("availability") == "not available"):
-            connected.add(src["name"])
-    return connected
+        mics.append((src, not (active and active[0].get("availability") == "not available")))
+    return mics
+
+
+def parse_connected_sources(sources: list[dict]) -> set[str]:
+    """The recordable sources in `pactl -f json list sources` output."""
+    return {src["name"] for src, plugged in microphones(sources) if plugged}
 
 
 class Recorder:

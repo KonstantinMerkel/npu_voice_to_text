@@ -184,7 +184,7 @@ fi
 # ---- microphone. Recommended: a wired or built-in mic (the system default if it
 # is one), so dictation doesn't follow the default to Bluetooth earbuds
 current_mic=$(opt_get --input-device)
-mapfile -t MICS < <(python3 -I "$SRC/tools/microphones.py" 2>/dev/null || true)
+mapfile -t MICS < <("$DATA/venv/bin/python" -I "$SRC/tools/microphones.py" 2>/dev/null || true)
 names=(); descs=(); lines=(); current=""; default=""; first=""
 for i in "${!MICS[@]}"; do
     IFS=$'\t' read -r name desc bus is_default plugged <<<"${MICS[$i]}"

@@ -13,6 +13,9 @@ import json
 import subprocess
 import sys
 
+# run with the venv's python: the same filter as the daemon
+from npu_voice_to_text.audio import microphones
+
 
 def run(*cmd: str) -> str:
     return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
@@ -24,13 +27,9 @@ def main() -> int:
         default = run("pactl", "get-default-source").strip()
     except (OSError, subprocess.CalledProcessError, json.JSONDecodeError):
         return 1
-    for s in sources:
+    for s, plugged in microphones(sources):
         props = s.get("properties", {})
-        if s["name"].endswith(".monitor") or props.get("device.class") == "monitor":
-            continue
         bus = props.get("device.bus") or props.get("device.api") or "?"
-        active = [p for p in s.get("ports", []) if p.get("name") == s.get("active_port")]
-        plugged = not (active and active[0].get("availability") == "not available")
         print(s["name"], s.get("description", s["name"]), bus, int(s["name"] == default),
               int(plugged), sep="\t")
     return 0
