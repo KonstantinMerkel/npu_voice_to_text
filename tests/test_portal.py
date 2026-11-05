@@ -280,7 +280,9 @@ def test_portal_restart_rebinds():
         gs.listen()
 
 
-def test_closed_dialog_counts_as_declined():
+def test_closed_dialog_counts_as_declined(monkeypatch):
+    import npu_voice_to_text.portal as portal_mod
+    monkeypatch.setattr(portal_mod, "HUMAN_SECONDS", 0)      # answered "slowly", by a person
     portals = []
 
     def connect():
@@ -301,3 +303,23 @@ def test_lost_release_is_delivered(monkeypatch):
     ])
     _, events = run_shortcut(portal)
     assert events == ["down", "up", "down", "up"]
+
+
+def test_instant_response_2_is_a_portal_failure_not_a_decline(token_file):
+    """The backend failed (response 2 at once): retried, not taken as the user's no."""
+    portal = FakePortal(start_code=2)
+    with pytest.raises(PortalError, match="response 2") as e:
+        RemoteKeyboard(token_file, connect=lambda: portal).open()
+    assert not isinstance(e.value, AccessDenied)
+
+    portals = []
+
+    def connect():
+        if len(portals) == 2:
+            raise SystemExit                        # end the test after one retry
+        portals.append(FakeShortcutPortal([], bind_code=2))
+        return portals[-1]
+    gs = GlobalShortcut(lambda: None, lambda: None, connect=connect)
+    with pytest.raises(SystemExit):
+        gs.run(retry_seconds=0)
+    assert len(portals) == 2 and not gs.denied

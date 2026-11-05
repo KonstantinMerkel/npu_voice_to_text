@@ -42,6 +42,9 @@ SHORTCUT_ID = "dictate"
 DEFAULT_TRIGGER = "F8"       # suggested in GNOME's dialog; the user may pick another key
 KEYBOARD = 1                 # device type
 PERSIST_UNTIL_REVOKED = 2    # persist_mode
+# Response 2 means a closed dialog (window close button) or a failed backend call.
+# A person needs longer than this to see a dialog and close it; a backend fails at once.
+HUMAN_SECONDS = 1.0
 TOKEN_FILE = paths.STATE_DIR / "keyboard-access.token"
 PERMISSION_TABLE = "remote-desktop"   # permission store table, used by uninstall.sh
 REPEAT_GAP = 3.0             # s without autorepeat after which `Activated` is a new press
@@ -297,14 +300,17 @@ def _request(conn, portal, method: str, signature: str, args: list, options_inde
     args[options_index]["handle_token"] = ("s", token)
     # subscribe before calling, or a fast answer is missed
     _call(conn, message_bus.AddMatch(rule))
+    t0 = time.monotonic()
     with conn.filter(rule) as responses:
         _call(conn, new_method_call(portal, method, signature, tuple(args)))
         try:
             code, results = conn.recv_until_filtered(responses, timeout=timeout).body
         except TimeoutError:
             raise NoAnswer(f"{method}: no answer within {timeout} s") from None
-    if code in (1, 2):           # 2: the dialog was closed (Escape, window close button)
-        raise AccessDenied(f"{method}: {'declined' if code == 1 else 'dialog closed'}")
+    if code == 1:
+        raise AccessDenied(f"{method}: declined")
+    if code == 2 and time.monotonic() - t0 >= HUMAN_SECONDS:
+        raise AccessDenied(f"{method}: dialog closed")
     if code != 0:
         raise PortalError(f"{method}: failed (response {code})")
     return results
