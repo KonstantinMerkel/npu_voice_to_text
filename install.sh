@@ -40,8 +40,10 @@ ok()   { printf '    \033[32m✓\033[0m %s\n' "$*"; }
 warn() { printf '    \033[33m!\033[0m %s\n' "$*"; }
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 ask()  { local reply; read -rp "    $1 " reply; printf '%s' "$reply"; }   # ask "question"
-LDCACHE=$(ldconfig -p)           # read once; `ldconfig -p | grep -q` breaks under pipefail
-has_lib() { [[ "$LDCACHE" == *"$1"* ]]; }
+# Load the library the way the daemon does (ctypes, 64-bit python3, no
+# LD_LIBRARY_PATH, which the service doesn't inherit). Unlike searching
+# `ldconfig -p`, this needs no sbin on PATH or ld.so.cache, and skips 32-bit copies.
+has_lib() { env -u LD_LIBRARY_PATH python3 -I -c 'import ctypes, sys; ctypes.CDLL(sys.argv[1])' "$1" 2>/dev/null; }
 
 # --------------------------------------------------------------------------- #
 step "Checking requirements"
@@ -51,11 +53,13 @@ missing=()
 for cmd in python3 curl ar tar gsettings gdbus gnome-shell; do
     command -v "$cmd" >/dev/null || missing+=("$cmd")
 done
-has_lib libze_loader.so.1    || missing+=("Level Zero loader (Fedora: oneapi-level-zero, Ubuntu: libze1)")
-has_lib libtbb.so.12         || missing+=("oneTBB (Fedora: tbb, Ubuntu: libtbb12)")
-has_lib libportaudio.so.2    || missing+=("PortAudio (Fedora: portaudio, Ubuntu: libportaudio2)")
-has_lib libxkbcommon.so.0    || missing+=("libxkbcommon")
-python3 -I -c 'from gi.repository import Gio' 2>/dev/null || missing+=("PyGObject (Fedora: python3-gobject, Ubuntu: python3-gi)")
+if command -v python3 >/dev/null; then       # the library checks need it
+    has_lib libze_loader.so.1    || missing+=("Level Zero loader (Fedora: oneapi-level-zero, Ubuntu: libze1)")
+    has_lib libtbb.so.12         || missing+=("oneTBB (Fedora: tbb, Ubuntu: libtbb12)")
+    has_lib libportaudio.so.2    || missing+=("PortAudio (Fedora: portaudio, Ubuntu: libportaudio2)")
+    has_lib libxkbcommon.so.0    || missing+=("libxkbcommon")
+    python3 -I -c 'from gi.repository import Gio' 2>/dev/null || missing+=("PyGObject (Fedora: python3-gobject, Ubuntu: python3-gi)")
+fi
 (( ${#missing[@]} == 0 )) || die "missing: ${missing[*]}"
 # GNOME 48 brought the global shortcuts portal (the dictation key)
 gnome=$(gnome-shell --version | grep -o '[0-9]\+' | head -1 || true)
