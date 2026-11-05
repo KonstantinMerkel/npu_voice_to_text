@@ -208,8 +208,14 @@ fi
 mic=${default:-${first:-0}}
 mic_text="the system default"
 if (( ${#MICS[@]} == 0 )); then
-    warn "could not list microphones (is pactl installed?) - dictation uses the system default"
-    mic=0
+    # pactl missing, or only monitors (the preferred USB mic unplugged): keep it
+    if [[ -n $current ]]; then
+        warn "could not list microphones (is pactl installed?) - keeping $current_mic"
+        mic=$current
+    else
+        warn "could not list microphones (is pactl installed?) - dictation uses the system default"
+        mic=0
+    fi
 elif (( custom )); then
     title "Microphone"
     cat <<'EOF'
