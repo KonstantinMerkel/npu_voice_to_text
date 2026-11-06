@@ -340,6 +340,8 @@ if [[ -z $key ]]; then
 EOF
 fi
 [[ -s $TOKEN && -n $key ]] || echo "    GNOME remembers both answers; ./uninstall.sh revokes them."
+# a unit that hit its start limit (StartLimitBurst) refuses to start until reset
+systemctl --user reset-failed npu-voice-to-text 2>/dev/null || true
 systemctl --user restart npu-voice-to-text
 restarts=$(systemctl --user show -p NRestarts --value npu-voice-to-text)
 printf '    starting (the first start compiles the model for the NPU, up to a few minutes) '
@@ -352,8 +354,8 @@ for (( i = 0; ; i++ )); do
             die "no keyboard access - re-run ./install.sh; in the GNOME dialog switch on \"Allow Remote Interaction\", keep \"Remember This Selection\" ticked, click Share"
         die "the service failed - see: journalctl --user -u npu-voice-to-text"
     fi
-    # Restart=on-failure every 5 s never hits systemd's start limit, so a crash loop
-    # never shows as "failed" - look at the restart counter instead
+    # a crash loop only shows as "failed" after the unit's start limit (5 starts
+    # in 5 min): look at the restart counter to catch it at the first restart
     (( $(systemctl --user show -p NRestarts --value npu-voice-to-text) == restarts )) ||
         { echo; die "the service keeps crashing - see: journalctl --user -u npu-voice-to-text"; }
     (( i < 900 )) || { echo; die "not ready after 15 min - see: journalctl --user -u npu-voice-to-text"; }

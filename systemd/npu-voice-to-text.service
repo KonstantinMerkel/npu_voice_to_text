@@ -2,6 +2,9 @@
 Description=npu-voice-to-text: hold-to-talk dictation with Whisper on the Intel NPU
 After=graphical-session.target
 PartOf=graphical-session.target
+# give up after 5 failed starts in 5 minutes instead of retrying forever.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 # Options are read from ~/.config/npu-voice-to-text/options (one per line, written by

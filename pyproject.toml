@@ -9,7 +9,7 @@ description = "Hold-to-talk dictation for GNOME Wayland, Whisper on the Intel NP
 readme = "README.md"
 license = "GPL-3.0-or-later"
 authors = [{ name = "Konstantin Merkel" }]
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.15"            # openvino-genai 2026.4 has no cp315 wheels
 # openvino-genai must match the Intel NPU libraries fetched by install.sh
 # (linux-npu-driver v1.38 <-> OpenVINO 2026.4). Upgrade both together.
 dependencies = [

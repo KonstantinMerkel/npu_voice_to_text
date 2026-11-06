@@ -25,7 +25,7 @@ About two seconds later the text is typed into the focused window.
 - Intel Core Ultra CPU with an NPU: `/dev/accel/accel0` exists (kernel driver `intel_vpu`) and you can read and write it
 - NPU firmware from your distro (`intel-npu-firmware` on Fedora, `linux-firmware` elsewhere)
 - GNOME 48 or newer, on Wayland, with `xdg-desktop-portal-gnome` (installed with GNOME)
-- Python 3.10+ and a few system libraries:
+- Python 3.10 to 3.14 (OpenVINO has no Python 3.15 packages yet) and a few system libraries:
 
 ```bash
 # Fedora
@@ -70,6 +70,7 @@ Start with the log: `journalctl --user -u npu-voice-to-text -f`.
 
 | Problem | Fix |
 |---|---|
+| Stopped working after a distro upgrade (`No module named npu_voice_to_text` or `openvino`) | The upgrade replaced the Python the venv was built with. OpenVINO needs Python 3.14 or older: install it (Fedora 45: `sudo dnf install python3.14`), then rebuild the venv with `python3.14 -m venv --clear ~/.local/share/npu-voice-to-text/venv && ~/.local/share/npu-voice-to-text/venv/bin/pip install .` and `systemctl --user restart npu-voice-to-text`. |
 | `NPU` missing from the installer's device list | Check `ls -l /dev/accel/accel0` and the firmware (`dmesg \| grep intel_vpu`). |
 | `Compilation failed … vclAllocatedExecutableCreate2` | The NPU compiler doesn't match OpenVINO. Bump `openvino-genai` in `pyproject.toml` and `NPU_DRIVER_*` in `install.sh` together. |
 | The key does nothing | The log should say `dictation key: …`. If it says `no dictation key`, re-run `./install.sh`. On laptops, F-keys are often media keys: use Fn or FnLock. |
