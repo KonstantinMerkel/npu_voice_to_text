@@ -258,12 +258,13 @@ if (( custom )); then
 
     title "Typing speed"
     echo "    Some apps lose characters when they are typed too fast."
-    speeds=(2 4 10)
-    printf '    1) fast      ~0.5 s for 50 words\n    2) normal    ~1 s\n    3) careful   ~2.5 s\n'
+    speeds=(0 2 4 10)
+    printf '    1) instant   no pause between keys, some apps may drop characters\n'
+    printf '    2) fast      ~0.5 s for 50 words\n    3) normal    ~1 s\n    4) careful   ~2.5 s\n'
     speed=0
     for i in "${!speeds[@]}"; do [[ ${speeds[$i]} == "$delay" ]] && speed=$((i + 1)); done
     (( speed )) || printf '    0) keep the current %s ms per key\n' "$delay"
-    speed=$(pick "$speed" 3)
+    speed=$(pick "$speed" ${#speeds[@]})
     (( speed )) && delay=${speeds[$((speed - 1))]}
 
     title "Languages"
@@ -293,7 +294,7 @@ if [[ $fallback == en ]]; then opt_set --fallback-language; else opt_set --fallb
 if [[ $sounds == y ]]; then opt_set --sounds ""; else opt_set --sounds; fi
 if [[ $space == y ]]; then opt_set --no-trailing-space; else opt_set --no-trailing-space ""; fi
 
-case $delay in 2) speed_text=fast ;; 4) speed_text=normal ;; 10) speed_text=careful ;;
+case $delay in 0) speed_text=instant ;; 2) speed_text=fast ;; 4) speed_text=normal ;; 10) speed_text=careful ;;
                *) speed_text="$delay ms per key" ;; esac
 ok "microphone:     $mic_text"
 ok "dictation key:  ${key:-GNOME asks for it in a moment}"
